@@ -177,13 +177,65 @@ int cetrafs_zg_get_info_prefetched(struct super_block *sb, u32 zg_id, struct cet
     return ret;
 }
 
+struct cetrafs_sr_zg_ctx {
+    cetrafs_zone_group_t *out;
+    u32 zg_id;
+    bool unlocked;    /* read once: the lock and its unlock are paired on it */
+    bool misdirected; /* out: a valid record of another group */
+};
+
+/* cetrafs_read_stable()'s judge for a Zone Group record: copied to c->out. */
+static int cetrafs_sr_zg(struct buffer_head *bh, void *ctx)
+{
+    struct cetrafs_sr_zg_ctx *c = ctx;
+    const cetrafs_zone_group_t *zg = (const cetrafs_zone_group_t *) bh->b_data;
+    cetrafs_zone_group_t *out = c->out;
+    bool ok;
+
+    /* Verified and copied under the buffer lock, which every
+     * in-place patch of a cached block takes: checked on the
+     * live buffer and copied after, a patch landing in between
+     * handed out an image the checksum never saw (audit L15).
+     * The copy is then checked against its own checksum too: a
+     * copy that fails it was torn, and is read again. */
+    if (!c->unlocked)
+        cetrafs_bh_read_lock(bh);
+    ok = !cetrafs_record_tear_injected("ZG record") &&
+         cetrafs_zg_hot_crc(bh->b_data) == (u32) le64_to_cpu(zg->hot_checksum) &&
+         (u32) le64_to_cpu(zg->cold_checksum) == cetrafs_zg_cold_crc(bh->b_data);
+    if (ok) {
+        unsigned int gap = READ_ONCE(cetrafs_zg_read_gap_ms);
+
+        if (gap)
+            msleep(gap);
+        memcpy(out, zg, sizeof(*out));
+    }
+    if (!c->unlocked)
+        cetrafs_bh_read_unlock(bh);
+    if (!ok)
+        return CETRAFS_SR_TORN;
+    /* Valid checksum, another group's id: a misdirected write or a
+     * copied sector. Persistent, so not retried, and damage like a
+     * record that never verifies -- not -EINVAL, which no sweep skips
+     * and which took the mount, every claim scan and statfs down with
+     * it (N-17). */
+    if (le16_to_cpu(out->zg_id) != (u16) c->zg_id) {
+        c->misdirected = true;
+        return -EUCLEAN;
+    }
+    if (cetrafs_zg_hot_crc(out) == (u32) le64_to_cpu(out->hot_checksum) &&
+        cetrafs_zg_cold_crc(out) == (u32) le64_to_cpu(out->cold_checksum))
+        return 0;
+    atomic64_inc(&cetrafs_zg_copy_torn);
+    return CETRAFS_SR_TORN;
+}
+
 static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group_t *out, bool first_cached)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    struct buffer_head *bh;
-    const cetrafs_zone_group_t *zg;
-    u32 want, got;
-    bool misdirected = false;
+    struct cetrafs_sr_zg_ctx c = {.out = out, .zg_id = zg_id, .unlocked = READ_ONCE(cetrafs_zg_read_unlocked)};
+    bool misdirected;
+    int ret;
 
     if (!raw_sb)
         return -EINVAL;
@@ -196,66 +248,11 @@ static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_gro
      * procfs, cetrafs_zg_get_info() -- are deliberately lockless, so a
      * reader can observe a peer's in-flight 4 KiB record write torn. A
      * torn observation converges on re-read; only a persistent mismatch
-     * is real corruption. Same shape as inode.c/node.c/dir.c's retries. */
-    {
-        int attempt;
-
-        /* Read once: the lock and its unlock below are paired on this. */
-        bool unlocked = READ_ONCE(cetrafs_zg_read_unlocked);
-
-        for (attempt = 0; attempt < CETRAFS_RECORD_READ_RETRIES; attempt++) {
-            bh = attempt == 0 && first_cached ? cetrafs_bread_retry(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id)
-                                              : cetrafs_bread_uncached_retry(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id);
-            if (!bh)
-                return -EIO;
-
-            zg = (const cetrafs_zone_group_t *) bh->b_data;
-            /* Verified and copied under the buffer lock, which every
-             * in-place patch of a cached block takes: checked on the
-             * live buffer and copied after, a patch landing in between
-             * handed out an image the checksum never saw (audit L15).
-             * The copy is then checked against its own checksum too: a
-             * copy that fails it was torn, and is read again. */
-            if (!unlocked)
-                cetrafs_bh_read_lock(bh);
-            want = (u32) le64_to_cpu(zg->hot_checksum);
-            got = cetrafs_zg_hot_crc(bh->b_data);
-            if (!cetrafs_record_tear_injected("ZG record") && got == want &&
-                (u32) le64_to_cpu(zg->cold_checksum) == cetrafs_zg_cold_crc(bh->b_data)) {
-                unsigned int gap = READ_ONCE(cetrafs_zg_read_gap_ms);
-
-                if (gap)
-                    msleep(gap);
-                memcpy(out, zg, sizeof(*out));
-                if (!unlocked)
-                    cetrafs_bh_read_unlock(bh);
-                brelse(bh);
-                /* Valid checksum, another group's id: a misdirected
-                 * write or a copied sector. Persistent, so not retried,
-                 * and damage like a record that never verifies -- not
-                 * -EINVAL, which no sweep skips and which took the mount,
-                 * every claim scan and statfs down with it (N-17). */
-                if (le16_to_cpu(out->zg_id) != (u16) zg_id) {
-                    misdirected = true;
-                    goto damaged;
-                }
-                if (cetrafs_zg_hot_crc(out) == (u32) le64_to_cpu(out->hot_checksum) &&
-                    cetrafs_zg_cold_crc(out) == (u32) le64_to_cpu(out->cold_checksum))
-                    return 0;
-                atomic64_inc(&cetrafs_zg_copy_torn);
-            } else {
-                if (!unlocked)
-                    cetrafs_bh_read_unlock(bh);
-                brelse(bh);
-            }
-
-            /* Same backoff as the inode-record and node-row readers: a
-             * checksum tear here is a peer's in-flight write, which
-             * takes milliseconds, not microseconds (E2). */
-            if (attempt + 1 < CETRAFS_RECORD_READ_RETRIES)
-                cetrafs_tear_backoff(attempt);
-        }
-    }
+     * is real corruption (cetrafs_read_stable()). */
+    ret = cetrafs_read_stable(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id, CETRAFS_RECORD_READ_RETRIES,
+                              CETRAFS_SR_CACHED_FRESH, !first_cached, cetrafs_sr_zg, &c, NULL, NULL);
+    if (ret != -EAGAIN && ret != -EUCLEAN)
+        return ret;
 
     /*
      * Damaged, not torn. A record this node owns is its own metadata and
@@ -266,7 +263,7 @@ static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_gro
      * 2026-11-15 B-14) took the whole volume down for one sector. Each
      * caller leaves it out; reported once.
      */
-damaged:
+    misdirected = c.misdirected;
     if (cetrafs_sb_zg_owned_cached(sb, zg_id) || READ_ONCE(cetrafs_zg_unreadable_fatal)) {
         pr_err("ZG %u %s -- corrupted, not just a torn concurrent read\n", zg_id,
                misdirected ? "holds another group's record" : "failed its checksum repeatedly");

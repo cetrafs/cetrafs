@@ -2867,10 +2867,19 @@ static bool cetrafs_tear_awaits_replay(struct super_block *sb, u64 ino, u64 gene
     return false;
 }
 
+/* cetrafs_read_stable()'s judge for a tail-checksummed block: kept. */
+static int cetrafs_sr_blk_tail(struct buffer_head *bh, void *ctx)
+{
+    const u32 *magic = ctx;
+
+    return cetrafs_blk_read_accepts(bh, *magic) ? CETRAFS_SR_KEEP : CETRAFS_SR_TORN;
+}
+
 static struct buffer_head *__cetrafs_blk_tail_bread(struct super_block *sb, u64 ino, u64 generation, u64 lba,
                                                    u32 magic, const char *what, bool *unjudged)
 {
-    int attempt, nbad = 0, chk;
+    struct buffer_head *bh = NULL;
+    int nread, chk;
 
     /* The block is its file's: marking inode 0 counted the damage and
      * refused nothing, so writes went on through a tree that had just
@@ -2894,26 +2903,17 @@ static struct buffer_head *__cetrafs_blk_tail_bread(struct super_block *sb, u64 
         return NULL;
     }
 
-    for (attempt = 0; attempt < CETRAFS_BLK_TAIL_READ_RETRIES; attempt++) {
-        struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
-
-        if (bh) {
-            if (!cetrafs_tear_injected() && cetrafs_blk_tail_valid(bh, magic))
-                return bh;
-            brelse(bh);
-            nbad++;
-        }
-        if (attempt + 1 < CETRAFS_BLK_TAIL_READ_RETRIES)
-            cetrafs_tear_backoff(attempt);
-    }
+    if (!cetrafs_read_stable(sb, lba, CETRAFS_BLK_TAIL_READ_RETRIES, CETRAFS_SR_FRESH, true, cetrafs_sr_blk_tail,
+                             &magic, &bh, &nread))
+        return bh;
 
     /* Corrupt only if every attempt READ the block and every one failed
      * its checks. A read that failed is the device's error, not the
      * block's: counting it made a transient path error "run fsck" and,
      * under corruption=stop, a stopped mount (ERRORS.md kind 1). */
-    if (nbad < CETRAFS_BLK_TAIL_READ_RETRIES) {
+    if (nread < CETRAFS_BLK_TAIL_READ_RETRIES) {
         pr_err_ratelimited("%s block %llu could not be read (%d of %d attempts failed) -- I/O error\n", what,
-                           (unsigned long long) lba, CETRAFS_BLK_TAIL_READ_RETRIES - nbad,
+                           (unsigned long long) lba, CETRAFS_BLK_TAIL_READ_RETRIES - nread,
                            CETRAFS_BLK_TAIL_READ_RETRIES);
         return NULL;
     }

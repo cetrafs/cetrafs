@@ -1026,6 +1026,83 @@ void cetrafs_bh_abort_update(struct buffer_head *bh);
 #define CETRAFS_BREAD_RETRIES 12
 struct buffer_head *cetrafs_bread_retry(struct super_block *sb, sector_t block);
 struct buffer_head *cetrafs_bread_uncached_retry(struct super_block *sb, sector_t block);
+
+/*
+ * The torn-read retry every checksummed block and record reader shares.
+ * A check that fails is usually a peer's write in flight, seen torn: it
+ * converges once that write lands, so the block is read again after
+ * cetrafs_tear_backoff()'s pause, up to 'tries' reads. Each reader had
+ * its own copy of this loop, and the copies drifted in budget and pause
+ * (audit 2026-11-22 section 5, item 1; N-65 was one such drift).
+ *
+ * 'how' is the read each try makes:
+ *   FRESH        every try forced fresh; a read that fails is counted
+ *                (not in *nread) and tried again.
+ *   CACHED_INVAL the first try cached unless 'fresh', the rest after an
+ *                invalidate; a read that fails ends it (-EIO).
+ *   CACHED_FRESH the first try cached unless 'fresh', the rest forced
+ *                fresh; a read that fails ends it (-EIO).
+ * 'judge' sees each block read: CETRAFS_SR_KEEP hands the buffer to the
+ * caller (*keep), 0 accepts it (released here; the judge copied what it
+ * needed), CETRAFS_SR_TORN reads again, and an errno ends it.
+ *
+ * 0 or the judge's error; -EAGAIN when every try came back torn or
+ * unread, *nread the tries that read the block. What a block that never
+ * converged MEANS -- damage, an I/O error, a reuse -- is the caller's
+ * verdict, not this loop's.
+ *
+ * Inline so each reader's judge is a direct call: the BG descriptor read
+ * is on the allocation path (docs/PERFORMANCE.md, PERF(6)).
+ */
+#include <linux/buffer_head.h>
+enum cetrafs_stable_read { CETRAFS_SR_FRESH, CETRAFS_SR_CACHED_INVAL, CETRAFS_SR_CACHED_FRESH };
+#define CETRAFS_SR_TORN 1
+#define CETRAFS_SR_KEEP 2
+static __always_inline int cetrafs_read_stable(struct super_block *sb, sector_t lba, int tries,
+                                               enum cetrafs_stable_read how, bool fresh,
+                                               int (*judge)(struct buffer_head *bh, void *ctx), void *ctx,
+                                               struct buffer_head **keep, int *nread)
+{
+    int attempt, v, got = 0;
+
+    for (attempt = 0; attempt < tries; attempt++) {
+        bool cached = !attempt && !fresh;
+        struct buffer_head *bh;
+
+        if (how == CETRAFS_SR_FRESH) {
+            bh = cetrafs_bread_uncached(sb, lba);
+        } else if (how == CETRAFS_SR_CACHED_INVAL) {
+            if (!cached)
+                cetrafs_invalidate_block(sb, lba);
+            bh = cetrafs_bread_retry(sb, lba);
+        } else {
+            bh = cached ? cetrafs_bread_retry(sb, lba) : cetrafs_bread_uncached_retry(sb, lba);
+        }
+        if (bh) {
+            got++;
+            v = judge(bh, ctx);
+            if (v == CETRAFS_SR_KEEP) {
+                *keep = bh;
+                v = 0;
+                goto out;
+            }
+            brelse(bh);
+            if (v != CETRAFS_SR_TORN)
+                goto out;
+        } else if (how != CETRAFS_SR_FRESH) {
+            v = -EIO;
+            goto out;
+        }
+        if (attempt + 1 < tries)
+            cetrafs_tear_backoff(attempt);
+    }
+    v = -EAGAIN;
+out:
+    if (nread)
+        *nread = got;
+    return v;
+}
+
 int cetrafs_bread_uncached_batch(struct super_block *sb, sector_t start, u32 n, struct buffer_head **bhs);
 const char *cetrafs_block_role(struct super_block *sb, u64 lba);
 int cetrafs_bread_uncached_list(struct super_block *sb, const sector_t *list, u32 n, struct buffer_head **bhs);

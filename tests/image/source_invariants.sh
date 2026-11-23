@@ -165,6 +165,58 @@ rm -f /tmp/ct_audit_missing.$$
 [ -z "$MISSING" ] && pass "record readers: every checksum-verifying retry loop backs off" ||
     fail "record readers: retry loop with no backoff at: $MISSING"
 
+# ...and the loop is written once: cetrafs_read_stable() (kmod.h). Seven
+# copies had drifted in budget and pause (audit 2026-11-22 section 5,
+# item 1). Every other function that paces with cetrafs_tear_backoff() is
+# listed with why it is not that loop.
+#   xattr.c: re-reads the RECORD around a block cetrafs_blk_tail_bread()
+#     already read through the shared loop; the pause waits for a peer's
+#     setxattr, not for a tear.
+#   leafdefer.c: raw device reads (bdev_rw_virt) retried on an I/O error.
+#   dmpath.c: two images compared, not one validated.
+TEAR_OK='
+xattr.c|cetrafs_xattr_read_block
+leafdefer.c|cetrafs_window_read_block
+leafdefer.c|cetrafs_window_read_stamp
+dmpath.c|cetrafs_dmpath_identical
+'
+tear_sites() {
+    for f in "$@"; do
+        awk -v F="$(basename "$f")" '
+            /^[a-z].*\(/ && !/;$/ { match($0, /[a-z_0-9]+\(/); fname = substr($0, RSTART, RLENGTH - 1) }
+            /^[[:space:]]*\*/ || /^[[:space:]]*\/\*/ { next }
+            /cetrafs_tear_backoff\(/ && fname != "cetrafs_tear_backoff" { print F "|" fname }' "$f"
+    done | sort -u
+}
+TEARP="$(mktemp -d)"
+cat >"$TEARP/planted.c" <<'EOF'
+static int planted_reader(struct super_block *sb, u64 lba)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 9; attempt++)
+        cetrafs_tear_backoff(attempt);
+    return 0;
+}
+EOF
+[ "$(tear_sites "$TEARP/planted.c")" = "planted.c|planted_reader" ] &&
+    pass "record readers: control -- a planted open-coded retry loop is found" ||
+    fail "record readers: control -- the planted loop gave '$(tear_sites "$TEARP/planted.c")'"
+rm -rf "$TEARP"
+TSEEN="$(tear_sites "$K"/*.c)"
+TBAD=""
+while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    grep -qxF "$row" <<<"$TEAR_OK" || TBAD="$TBAD $row"
+done <<<"$TSEEN"
+while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    grep -qxF "$row" <<<"$TSEEN" || TBAD="$TBAD stale-entry:$row"
+done <<<"$TEAR_OK"
+grep -q 'cetrafs_tear_backoff(attempt)' "$K/kmod.h" || TBAD="$TBAD kmod.h:cetrafs_read_stable-has-no-backoff"
+[ -z "$TBAD" ] && pass "record readers: the torn-read retry loop is cetrafs_read_stable() alone" ||
+    fail "record readers: an open-coded torn-read retry outside cetrafs_read_stable():$TBAD -- use the helper, or list it in TEAR_OK with why"
+
 log "checking no forced-fresh read turns a racing NULL into a hard error"
 # CLAUDE.md: a NULL from a forced-fresh read is usually another thread's
 # invalidation, not a device error -- any site whose NULL becomes -EIO

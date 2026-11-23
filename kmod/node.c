@@ -110,10 +110,24 @@ int cetrafs_node_get_entry_prefetched(struct super_block *sb, u32 idx, cetrafs_n
     return __cetrafs_read_node_entry(sb, idx, out, true);
 }
 
+/* cetrafs_read_stable()'s judge for a node row: copied to 'ctx'. */
+static int cetrafs_sr_node_row(struct buffer_head *bh, void *ctx)
+{
+    cetrafs_node_entry_t *out = ctx;
+
+    memcpy(out, bh->b_data, sizeof(*out));
+    if (!cetrafs_record_tear_injected("node row") &&
+        ((cetrafs_le32(out->state) == CETRAFS_NODE_STATE_FREE &&
+          (cetrafs_node_entry_blank(out) || READ_ONCE(cetrafs_node_free_any))) ||
+         cetrafs_node_crc(out) == (u32) cetrafs_le64(out->checksum)))
+        return 0;
+    return CETRAFS_SR_TORN;
+}
+
 static int __cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out, bool first_cached)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    struct buffer_head *bh;
+    int ret;
 
     if (!raw_sb)
         return -EINVAL;
@@ -133,40 +147,21 @@ static int __cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_no
      * (staleness checks, procfs's cluster dump, this very function) are
      * deliberately lockless -- so a reader can observe that write torn.
      * The writer always syncs, so a torn observation converges on
-     * re-read; only a persistent mismatch is real corruption. Same shape
-     * as inode.c's record-read retry and dir.c's dirent-tail retry. */
-    {
-        int attempt;
-
-        for (attempt = 0; attempt < CETRAFS_RECORD_READ_RETRIES; attempt++) {
-            /* Retrying read: a NULL here is usually not an I/O error
-             * but a concurrent forced-fresh read of the same block
-             * clearing uptodate under us. Bailing out turned that into
-             * a hard -EIO -- and this function is on the namespace-lock
-             * path (cetrafs_node_is_stale() of a foreign holder), so it
-             * failed a plain create() on whichever node LOST the lock
-             * race, which is exactly the asymmetry seen on real two-node
-             * hardware. */
-            bh = attempt == 0 && first_cached ? cetrafs_bread_retry(sb, le64_to_cpu(raw_sb->node_table_start) + idx)
-                                              : cetrafs_bread_uncached_retry(sb, le64_to_cpu(raw_sb->node_table_start) + idx);
-            if (!bh)
-                return -EIO;
-
-            memcpy(out, bh->b_data, sizeof(*out));
-            brelse(bh);
-
-            if (!cetrafs_record_tear_injected("node row") &&
-                ((cetrafs_le32(out->state) == CETRAFS_NODE_STATE_FREE &&
-                  (cetrafs_node_entry_blank(out) || READ_ONCE(cetrafs_node_free_any))) ||
-                 cetrafs_node_crc(out) == (u32) cetrafs_le64(out->checksum)))
-                return 0;
-
-            /* Same backoff as the inode-record reader: a tear is a
-             * peer's in-flight write, which takes milliseconds (E2). */
-            if (attempt + 1 < CETRAFS_RECORD_READ_RETRIES)
-                cetrafs_tear_backoff(attempt);
-        }
-    }
+     * re-read; only a persistent mismatch is real corruption
+     * (cetrafs_read_stable(), the loop every such reader shares).
+     *
+     * Retrying read: a NULL is usually not an I/O error but a
+     * concurrent forced-fresh read of the same block clearing uptodate
+     * under us. Bailing out turned that into a hard -EIO -- and this
+     * function is on the namespace-lock path (cetrafs_node_is_stale() of
+     * a foreign holder), so it failed a plain create() on whichever node
+     * LOST the lock race, which is exactly the asymmetry seen on real
+     * two-node hardware. A tear is a peer's in-flight write, which takes
+     * milliseconds (E2). */
+    ret = cetrafs_read_stable(sb, le64_to_cpu(raw_sb->node_table_start) + idx, CETRAFS_RECORD_READ_RETRIES,
+                              CETRAFS_SR_CACHED_FRESH, !first_cached, cetrafs_sr_node_row, out, NULL, NULL);
+    if (ret != -EAGAIN)
+        return ret;
 
     pr_err("node row %u failed its checksum repeatedly -- corrupted, not just a torn concurrent read\n", idx);
     cetrafs_sb_corrupt(sb, 0);

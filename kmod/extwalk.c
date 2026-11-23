@@ -139,31 +139,32 @@ static void cetrafs_tree_read_batch(struct inode *inode, const sector_t *lbas, u
  * its proposing pass, forced fresh and tail-checked (with the tear retry)
  * on its deciding one. The address is checked first either way (rule 19).
  */
+/* cetrafs_read_stable()'s judge for the scrub: checked under the buffer
+ * lock, kept. */
+static int cetrafs_sr_scrub_tree(struct buffer_head *bh, void *ctx)
+{
+    const u32 *magic = ctx;
+    bool ok;
+
+    cetrafs_bh_read_lock(bh);
+    ok = cetrafs_blk_tail_valid(bh, *magic);
+    cetrafs_bh_read_unlock(bh);
+    return ok ? CETRAFS_SR_KEEP : CETRAFS_SR_TORN;
+}
+
 struct buffer_head *cetrafs_scrub_tree_bread(struct super_block *sb, u64 lba, u32 magic, bool fresh)
 {
-    int attempt;
+    struct buffer_head *bh = NULL;
 
     if (!cetrafs_lba_run_is_data(sb, lba, 1))
         return NULL;
     if (!fresh)
         return cetrafs_bread_retry(sb, lba); /* pass 1 only proposes candidates */
-    for (attempt = 0; attempt < CETRAFS_BLK_TAIL_READ_RETRIES; attempt++) {
-        struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
-
-        if (bh) {
-            bool ok;
-
-            cetrafs_bh_read_lock(bh);
-            ok = cetrafs_blk_tail_valid(bh, magic);
-            cetrafs_bh_read_unlock(bh);
-            if (ok)
-                return bh;
-            brelse(bh);
-        }
-        if (attempt + 1 < CETRAFS_BLK_TAIL_READ_RETRIES)
-            cetrafs_tear_backoff(attempt); /* a peer's write in flight (X1) */
-    }
-    return NULL;
+    /* a mismatch is a peer's write in flight (X1) */
+    if (cetrafs_read_stable(sb, lba, CETRAFS_BLK_TAIL_READ_RETRIES, CETRAFS_SR_FRESH, true, cetrafs_sr_scrub_tree,
+                            &magic, &bh, NULL))
+        return NULL;
+    return bh;
 }
 
 /* Read the n children of one index node, all at 'level'. */

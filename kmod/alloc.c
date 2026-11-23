@@ -1824,10 +1824,59 @@ static bool cetrafs_bg_geom_sane(const cetrafs_superblock_t *raw_sb, u32 bg_id, 
  * -- and 'fresh' forces even the first read past the cache, since a
  * refresh is the first look at blocks a peer has just written.
  */
+struct cetrafs_sr_bg_ctx {
+    struct super_block *sb;
+    const cetrafs_superblock_t *raw_sb;
+    u32 bg_id;
+    struct cetrafs_bg_geom *out;
+};
+
+/* cetrafs_read_stable()'s judge for a BG descriptor: its geometry to c->out. */
+static int cetrafs_sr_bg(struct buffer_head *bh, void *ctx)
+{
+    struct cetrafs_sr_bg_ctx *c = ctx;
+    struct cetrafs_bg_geom *out = c->out;
+    const cetrafs_block_group_t *bg;
+
+    bg = (const cetrafs_block_group_t *) bh->b_data;
+    /* Under the buffer lock, as cetrafs_read_zg(): the free count is
+     * patched in place on this very buffer (audit L15). */
+    cetrafs_bh_read_lock(bh);
+    if (likely(!cetrafs_record_tear_injected("BG descriptor")) &&
+        cetrafs_bg_crc_verify(bh->b_data) == (u32) cetrafs_le64(bg->checksum)) {
+        if (!cetrafs_bg_geom_sane(c->raw_sb, c->bg_id, bg)) {
+            pr_err_ratelimited("BG %u descriptor describes an impossible Block Group (start %llu len %llu "
+                               "bitmap +%u data +%u count %llu) -- refusing it (fsck)\n",
+                               c->bg_id, (unsigned long long) cetrafs_le64(bg->start_block),
+                               (unsigned long long) cetrafs_le64(bg->length_blocks),
+                               cetrafs_le32(bg->off_data_bmap), cetrafs_le32(bg->off_data_region),
+                               (unsigned long long) cetrafs_le64(bg->data_block_count));
+            cetrafs_bh_read_unlock(bh);
+            cetrafs_sb_corrupt(c->sb, 0);
+            return -EUCLEAN;
+        }
+        out->start_block = cetrafs_le64(bg->start_block);
+        out->off_data_bmap = cetrafs_le32(bg->off_data_bmap);
+        out->off_data_region = cetrafs_le32(bg->off_data_region);
+        out->data_block_count = cetrafs_le64(bg->data_block_count);
+        out->length_blocks = cetrafs_le64(bg->length_blocks);
+        out->free_data_blocks = cetrafs_le64(bg->free_data_blocks);
+        out->reconcile_seq = cetrafs_le64(bg->reconcile_seq);
+        out->free_gen = cetrafs_le64(bg->free_gen);
+        out->owner_zg = cetrafs_le16(bg->owner_zg);
+        out->flags = cetrafs_le16(bg->flags);
+        cetrafs_bh_read_unlock(bh);
+        return 0;
+    }
+    cetrafs_bh_read_unlock(bh);
+    return CETRAFS_SR_TORN;
+}
+
 static int cetrafs_read_bg_geom_at(struct super_block *sb, const cetrafs_superblock_t *raw_sb, u32 bg_id, u64 blk,
                                    bool fresh, struct cetrafs_bg_geom *out)
 {
-    int attempt;
+    struct cetrafs_sr_bg_ctx c = {.sb = sb, .raw_sb = raw_sb, .bg_id = bg_id, .out = out};
+    int ret;
 
     atomic64_inc(&cetrafs_bg_geom_reads);
     if (!raw_sb || !blk)
@@ -1835,68 +1884,21 @@ static int cetrafs_read_bg_geom_at(struct super_block *sb, const cetrafs_superbl
     if (bg_id >= le32_to_cpu(raw_sb->block_group_count))
         return -EINVAL;
 
-    for (attempt = 0; attempt < CETRAFS_RECORD_READ_RETRIES; attempt++) {
-        const cetrafs_block_group_t *bg;
-        struct buffer_head *bh;
-
-        /* First attempt stays on the cached fast path (this is the
-         * per-allocation hot path for a BG's own owner, whose cache is
-         * authoritative); retries force a real re-read. */
-        /* PERF(6): attempt 0 stays cached -- docs/PERFORMANCE.md */
-        if (attempt > 0 || fresh)
-            cetrafs_invalidate_block(sb, blk);
-
-        bh = cetrafs_bread_retry(sb, blk);
-        if (!bh)
-            return -EIO;
-
-        bg = (const cetrafs_block_group_t *) bh->b_data;
-        /* Under the buffer lock, as cetrafs_read_zg(): the free count is
-         * patched in place on this very buffer (audit L15). */
-        cetrafs_bh_read_lock(bh);
-        if (likely(!cetrafs_record_tear_injected("BG descriptor")) &&
-            cetrafs_bg_crc_verify(bh->b_data) == (u32) cetrafs_le64(bg->checksum)) {
-            if (!cetrafs_bg_geom_sane(raw_sb, bg_id, bg)) {
-                pr_err_ratelimited("BG %u descriptor describes an impossible Block Group (start %llu len %llu "
-                                   "bitmap +%u data +%u count %llu) -- refusing it (fsck)\n",
-                                   bg_id, (unsigned long long) cetrafs_le64(bg->start_block),
-                                   (unsigned long long) cetrafs_le64(bg->length_blocks),
-                                   cetrafs_le32(bg->off_data_bmap), cetrafs_le32(bg->off_data_region),
-                                   (unsigned long long) cetrafs_le64(bg->data_block_count));
-                cetrafs_bh_read_unlock(bh);
-                cetrafs_sb_corrupt(sb, 0);
-                brelse(bh);
-                return -EUCLEAN;
-            }
-            out->start_block = cetrafs_le64(bg->start_block);
-            out->off_data_bmap = cetrafs_le32(bg->off_data_bmap);
-            out->off_data_region = cetrafs_le32(bg->off_data_region);
-            out->data_block_count = cetrafs_le64(bg->data_block_count);
-            out->length_blocks = cetrafs_le64(bg->length_blocks);
-            out->free_data_blocks = cetrafs_le64(bg->free_data_blocks);
-            out->reconcile_seq = cetrafs_le64(bg->reconcile_seq);
-            out->free_gen = cetrafs_le64(bg->free_gen);
-            out->owner_zg = cetrafs_le16(bg->owner_zg);
-            out->flags = cetrafs_le16(bg->flags);
-            cetrafs_bh_read_unlock(bh);
-            brelse(bh);
-            return 0;
-        }
-        cetrafs_bh_read_unlock(bh);
-        brelse(bh);
-
-        /* Back off, like every other checksummed-record reader: a
-         * mismatch here is a peer's in-flight counter write seen torn,
-         * and a peer's write takes milliseconds -- so the budget is
-         * cetrafs_tear_backoff()'s, the one X1 gave the block readers; the
-         * fixed 100-400 us it had spent the whole budget in about a
-         * millisecond (review E2). (This is the FIFTH such reader -- the
-         * P5 pass that added the backoff to the inode record, node row
-         * and ZG record enumerated four and missed this one, which lives
-         * in alloc.c rather than with the others.) */
-        if (attempt + 1 < CETRAFS_RECORD_READ_RETRIES)
-            cetrafs_tear_backoff(attempt);
-    }
+    /* First read stays on the cached fast path (this is the
+     * per-allocation hot path for a BG's own owner, whose cache is
+     * authoritative); retries force a real re-read.
+     * PERF(6): attempt 0 stays cached -- docs/PERFORMANCE.md
+     *
+     * Back off, like every other checksummed-record reader: a
+     * mismatch here is a peer's in-flight counter write seen torn,
+     * and a peer's write takes milliseconds -- so the budget is
+     * cetrafs_tear_backoff()'s, the one X1 gave the block readers; the
+     * fixed 100-400 us it had spent the whole budget in about a
+     * millisecond (review E2). */
+    ret = cetrafs_read_stable(sb, blk, CETRAFS_RECORD_READ_RETRIES, CETRAFS_SR_CACHED_INVAL, fresh, cetrafs_sr_bg,
+                              &c, NULL, NULL);
+    if (ret != -EAGAIN)
+        return ret;
 
     pr_err("BG %u failed its descriptor checksum repeatedly -- corrupted, not just a torn concurrent read\n", bg_id);
     /* Counted and marked for fsck, as an impossible geometry above is:

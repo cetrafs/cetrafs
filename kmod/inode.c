@@ -418,10 +418,74 @@ int cetrafs_read_raw_inode_walk(struct super_block *sb, u64 ino, cetrafs_inode_t
     return ret;
 }
 
+struct cetrafs_sr_inode_ctx {
+    struct super_block *sb;
+    u64 ino;
+    cetrafs_inode_t *out;
+};
+
+/* cetrafs_read_stable()'s judge for an inode record: copied to c->out. */
+static int cetrafs_sr_inode(struct buffer_head *bh, void *ctx)
+{
+    struct cetrafs_sr_inode_ctx *c = ctx;
+    cetrafs_inode_t *out = c->out;
+
+    /* Copy under the buffer lock. Every record writer modifies this
+     * buffer under lock_buffer() (ioutil.c's update protocol), and
+     * an unlocked memcpy can copy MID-MODIFICATION: a torn in-memory
+     * view that fails the checksum below even though the device and
+     * the writer are both perfectly fine. Under load the same
+     * record is rewritten constantly, so the retry loop can lose
+     * this race every attempt and declare 'corrupted, not just a
+     * torn concurrent read' against a healthy filesystem -- records
+     * dumped off the LUN seconds later verified VALID.
+     * The dirent reader has always blocked on the buffer lock for
+     * exactly this reason; the record reader never did. */
+    cetrafs_bh_copy_stable(bh, out, sizeof(*out));
+    if (!cetrafs_record_tear_injected("inode record") && cetrafs_inode_crcs_ok(out)) {
+        /* A valid record in the wrong slot -- a misdirected write,
+         * or a record copied to where it does not belong -- is not
+         * a torn read, and re-reading will not change it: it ends the
+         * read. Without
+         * this, every caller took the other inode's mode, size and
+         * EXTENTS as this one's. */
+        if (cetrafs_le64(out->ino) != c->ino) {
+            pr_err("ino=%llu: its slot holds a valid record for ino=%llu -- misplaced, refusing it\n",
+                   (unsigned long long) c->ino, (unsigned long long) cetrafs_le64(out->ino));
+            cetrafs_sb_corrupt(c->sb, c->ino);
+            return -EUCLEAN;
+        }
+        /* The size is a length read off the device and becomes
+         * i_size, a signed loff_t: past the format ceiling it names
+         * blocks no extent can address, and past 2^63 it is
+         * negative to every VFS path that reads it. A checksum
+         * proves neither. */
+        if (!cetrafs_size_sane(cetrafs_le64(out->size))) {
+            pr_err("ino=%llu: its record's size %llu is past the format's %llu-byte ceiling -- refusing it\n",
+                   (unsigned long long) c->ino, (unsigned long long) cetrafs_le64(out->size),
+                   (unsigned long long) CETRAFS_MAX_FILE_BYTES);
+            cetrafs_sb_corrupt(c->sb, c->ino);
+            return -EUCLEAN;
+        }
+        /* lock_mode is an enum: an unknown value passes the checksum
+         * and reads as "free" to the open path but "held" to the
+         * CAS mutators (audit L-F8). Refused here, for every reader. */
+        if (!cetrafs_lock_mode_ok_test(cetrafs_le32(out->lock_mode))) {
+            pr_err("ino=%llu: its record's lock_mode %u is not a lock state -- refusing it\n",
+                   (unsigned long long) c->ino, cetrafs_le32(out->lock_mode));
+            cetrafs_sb_corrupt(c->sb, c->ino);
+            return -EUCLEAN;
+        }
+        return 0;
+    }
+    return CETRAFS_SR_TORN;
+}
+
 static int __cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out, bool zero_ok)
 {
+    struct cetrafs_sr_inode_ctx c = {.sb = sb, .ino = ino, .out = out};
     u64 blk = cetrafs_inode_lba(sb, ino);
-    int attempt;
+    int ret;
 
     /* Past the table this node has: a peer's grow may have added the
      * segment the number is in, and its dirent reached us before our
@@ -440,81 +504,21 @@ static int __cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_ino
     if (!blk)
         return -EINVAL;
 
-    for (attempt = 0; attempt < CETRAFS_RAW_INODE_READ_RETRIES; attempt++) {
-        struct buffer_head *bh;
-
-        /* First attempt stays on the normal cached path (the hot paths'
-         * whole point); every retry forces a real device re-read, since
-         * the mismatched bytes may be a stale/torn cached view. */
-        if (attempt > 0)
-            cetrafs_invalidate_block(sb, blk);
-
-        bh = cetrafs_bread_retry(sb, blk);
-        if (!bh)
-            return -EIO;
-
-        /* Copy under the buffer lock. Every record writer modifies this
-         * buffer under lock_buffer() (ioutil.c's update protocol), and
-         * an unlocked memcpy can copy MID-MODIFICATION: a torn in-memory
-         * view that fails the checksum below even though the device and
-         * the writer are both perfectly fine. Under load the same
-         * record is rewritten constantly, so the retry loop can lose
-         * this race every attempt and declare 'corrupted, not just a
-         * torn concurrent read' against a healthy filesystem -- records
-         * dumped off the LUN seconds later verified VALID.
-         * The dirent reader has always blocked on the buffer lock for
-         * exactly this reason; the record reader never did. */
-        cetrafs_bh_copy_stable(bh, out, sizeof(*out));
-        brelse(bh);
-
-        if (!cetrafs_record_tear_injected("inode record") && cetrafs_inode_crcs_ok(out)) {
-            /* A valid record in the wrong slot -- a misdirected write,
-             * or a record copied to where it does not belong -- is not
-             * a torn read, and re-reading will not change it. Without
-             * this, every caller took the other inode's mode, size and
-             * EXTENTS as this one's. */
-            if (cetrafs_le64(out->ino) != ino) {
-                pr_err("ino=%llu: its slot holds a valid record for ino=%llu -- misplaced, refusing it\n",
-                       (unsigned long long) ino, (unsigned long long) cetrafs_le64(out->ino));
-                cetrafs_sb_corrupt(sb, ino);
-                return -EUCLEAN;
-            }
-            /* The size is a length read off the device and becomes
-             * i_size, a signed loff_t: past the format ceiling it names
-             * blocks no extent can address, and past 2^63 it is
-             * negative to every VFS path that reads it. A checksum
-             * proves neither. */
-            if (!cetrafs_size_sane(cetrafs_le64(out->size))) {
-                pr_err("ino=%llu: its record's size %llu is past the format's %llu-byte ceiling -- refusing it\n",
-                       (unsigned long long) ino, (unsigned long long) cetrafs_le64(out->size),
-                       (unsigned long long) CETRAFS_MAX_FILE_BYTES);
-                cetrafs_sb_corrupt(sb, ino);
-                return -EUCLEAN;
-            }
-            /* lock_mode is an enum: an unknown value passes the checksum
-             * and reads as "free" to the open path but "held" to the
-             * CAS mutators (audit L-F8). Refused here, for every reader. */
-            if (!cetrafs_lock_mode_ok_test(cetrafs_le32(out->lock_mode))) {
-                pr_err("ino=%llu: its record's lock_mode %u is not a lock state -- refusing it\n",
-                       (unsigned long long) ino, cetrafs_le32(out->lock_mode));
-                cetrafs_sb_corrupt(sb, ino);
-                return -EUCLEAN;
-            }
-            return 0;
-        }
-
-        /* Back off between attempts. A mismatch here is a peer's
-         * in-flight record write seen torn, and a peer's write takes
-         * milliseconds -- without a pause the whole retry budget is a
-         * few microseconds of re-reads and a perfectly transient tear
-         * is reported as -EUCLEAN. dir.c's dirent reader has always
-         * done this and says why; the record readers did not. The
-         * pause is cetrafs_tear_backoff()'s millisecond budget: a fixed
-         * 100-400 us did not span the write it was waiting for (review
-         * E2). */
-        if (attempt + 1 < CETRAFS_RAW_INODE_READ_RETRIES)
-            cetrafs_tear_backoff(attempt);
-    }
+    /* The first read stays on the normal cached path (the hot paths'
+     * whole point); every retry forces a real device re-read, since the
+     * mismatched bytes may be a stale/torn cached view.
+     *
+     * Back off between attempts. A mismatch here is a peer's
+     * in-flight record write seen torn, and a peer's write takes
+     * milliseconds -- without a pause the whole retry budget is a
+     * few microseconds of re-reads and a perfectly transient tear
+     * is reported as -EUCLEAN. The pause is cetrafs_tear_backoff()'s
+     * millisecond budget: a fixed 100-400 us did not span the write it
+     * was waiting for (review E2). */
+    ret = cetrafs_read_stable(sb, blk, CETRAFS_RAW_INODE_READ_RETRIES, CETRAFS_SR_CACHED_INVAL, false,
+                              cetrafs_sr_inode, &c, NULL, NULL);
+    if (ret != -EAGAIN)
+        return ret;
 
 #ifdef CETRAFS_TRACE
     {

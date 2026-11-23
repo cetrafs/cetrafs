@@ -273,46 +273,43 @@ static bool cetrafs_dirent_owner_alive(struct super_block *sb, u64 ino, u64 gene
     return alive;
 }
 
+/* cetrafs_read_stable()'s judge for a dirent block: kept. */
+static int cetrafs_sr_dirent(struct buffer_head *bh, void *unused)
+{
+    return !cetrafs_tear_injected() && cetrafs_dirent_block_valid(bh) ? CETRAFS_SR_KEEP : CETRAFS_SR_TORN;
+}
+
 static struct buffer_head *__cetrafs_dirent_bread_why(struct super_block *sb, u64 ino, u64 generation, u64 lba,
                                                       int *why)
 {
-    int attempt, nbad = 0;
+    struct buffer_head *bh = NULL;
+    int nread;
 
     *why = -EIO;
 
-    for (attempt = 0; attempt < CETRAFS_DIRENT_READ_RETRIES; attempt++) {
-        struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
-
-        if (bh) {
-            if (!cetrafs_tear_injected() && cetrafs_dirent_block_valid(bh))
-                return bh;
-            brelse(bh);
-            nbad++;
-        }
-
-        /* Back off between attempts rather than spinning. A mismatch
-         * here means a writer on ANOTHER node has a partially-written
-         * image of this block on the device; it converges once that
-         * node's write completes. (A writer on THIS node cannot be seen
-         * mid-update at all: cetrafs_bh_begin_update() holds the buffer
-         * lock across modify-and-restamp, which the forced-fresh read
-         * below blocks on.) Back off rather than spin, so the budget
-         * spans a peer's write rather than a few microseconds -- which
-         * the 100-400 us this slept did not: five of them are about
-         * 2 ms against a write that takes milliseconds (audit 2026-11-11
-         * X1). cetrafs_tear_backoff() is milliseconds, doubling.
-         * (A NULL read is retried on the same footing -- it means a
-         * concurrent forced-fresh read of the same block cleared the
-         * uptodate bit under us, which is equally transient.) */
-        if (attempt + 1 < CETRAFS_DIRENT_READ_RETRIES)
-            cetrafs_tear_backoff(attempt);
-    }
+    /* Read again on a mismatch rather than give up. A mismatch
+     * here means a writer on ANOTHER node has a partially-written
+     * image of this block on the device; it converges once that
+     * node's write completes. (A writer on THIS node cannot be seen
+     * mid-update at all: cetrafs_bh_begin_update() holds the buffer
+     * lock across modify-and-restamp, which the forced-fresh read
+     * below blocks on.) Back off rather than spin, so the budget
+     * spans a peer's write rather than a few microseconds -- which
+     * the 100-400 us this slept did not: five of them are about
+     * 2 ms against a write that takes milliseconds (audit 2026-11-11
+     * X1). cetrafs_tear_backoff() is milliseconds, doubling.
+     * (A NULL read is retried on the same footing -- it means a
+     * concurrent forced-fresh read of the same block cleared the
+     * uptodate bit under us, which is equally transient.) */
+    if (!cetrafs_read_stable(sb, lba, CETRAFS_DIRENT_READ_RETRIES, CETRAFS_SR_FRESH, true, cetrafs_sr_dirent, NULL,
+                             &bh, &nread))
+        return bh;
 
     /* Corrupt only if every attempt read the block and failed: a read
      * that failed is the device's error (cetrafs_blk_tail_bread()). */
-    if (nbad < CETRAFS_DIRENT_READ_RETRIES) {
+    if (nread < CETRAFS_DIRENT_READ_RETRIES) {
         pr_err_ratelimited("dirent block %llu could not be read (%d of %d attempts failed) -- I/O error\n",
-                           (unsigned long long) lba, CETRAFS_DIRENT_READ_RETRIES - nbad,
+                           (unsigned long long) lba, CETRAFS_DIRENT_READ_RETRIES - nread,
                            CETRAFS_DIRENT_READ_RETRIES);
         return NULL;
     }
