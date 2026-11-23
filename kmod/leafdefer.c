@@ -835,39 +835,138 @@ static int cetrafs_deferred_claim(struct super_block *sb, struct inode *inode, s
  * An unverifiable read counts as a loss: the correctness bar is "say
  * so", never "assume".
  */
+/* TEST ONLY: fail the window check's reads: 1 = the next block
+ * read-back once, 2 = the next stamp read once, 4 = every one
+ * (tests/kernel/window_check_read_retry.sh). */
+static unsigned int cetrafs_window_read_fail;
+cetrafs_test_param(window_read_fail, cetrafs_window_read_fail, uint, 0644);
+MODULE_PARM_DESC(window_read_fail, "TEST ONLY: fail the tree flush's read-back (1 block once, 2 stamp once, 4 all)");
+/* TEST ONLY: one failed read is a loss, as before audit 2026-11-22 N-7. */
+static bool cetrafs_window_read_no_retry;
+cetrafs_test_param(window_read_no_retry, cetrafs_window_read_no_retry, bool, 0644);
+MODULE_PARM_DESC(window_read_no_retry, "TEST ONLY: a tree flush's failed read-back counts as a loss at once");
+
+static bool cetrafs_window_read_injected(unsigned int bit, const char *what)
+{
+    unsigned int v = READ_ONCE(cetrafs_window_read_fail);
+
+    if (!(v & (bit | 4)))
+        return false;
+    if (!(v & 4))
+        (void) cmpxchg(&cetrafs_window_read_fail, v, v & ~bit);
+    pr_info("window_read_fail: failed a %s read\n", what);
+    return true;
+}
+
+#define CETRAFS_WINDOW_READ_TRIES 5
+
+/* One written block read back: 0 matches, 1 does not (a loss), or the
+ * read's error once every try failed. */
+static int cetrafs_window_read_block(struct buffer_head *bh, void *buf, u32 wcrc)
+{
+    int attempt, ret = -EIO;
+
+    for (attempt = 0; attempt < CETRAFS_WINDOW_READ_TRIES; attempt++) {
+        if (cetrafs_window_read_injected(1, "block"))
+            ret = -EIO;
+        else
+            ret = bdev_rw_virt(bh->b_bdev, bh->b_blocknr * (bh->b_size >> SECTOR_SHIFT), buf, CETRAFS_BLOCK_SIZE,
+                               REQ_OP_READ);
+        if (!ret)
+            return ~crc32c(~0U, buf, CETRAFS_BLOCK_SIZE) != wcrc;
+        if (READ_ONCE(cetrafs_window_read_no_retry))
+            return ret;
+        if (attempt + 1 < CETRAFS_WINDOW_READ_TRIES)
+            cetrafs_tear_backoff(attempt);
+    }
+    return ret;
+}
+
+/* The record's stamp, read: 0 with *seq set (0 when the record is now
+ * another incarnation's), or the read's error once every try failed. */
+static int cetrafs_window_read_stamp(struct super_block *sb, const struct cetrafs_journal_owner *o, u64 *seq)
+{
+    cetrafs_inode_t *raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    int attempt, ret = -ENOMEM;
+
+    for (attempt = 0; raw && attempt < CETRAFS_WINDOW_READ_TRIES; attempt++) {
+        if (cetrafs_window_read_injected(2, "stamp")) {
+            ret = -EIO;
+        } else {
+            cetrafs_invalidate_raw_inode(sb, o->ino);
+            ret = cetrafs_read_raw_inode(sb, o->ino, raw);
+        }
+        if (!ret) {
+            *seq = cetrafs_le64(raw->generation) == o->generation ? cetrafs_le64(raw->file_seq) : 0;
+            break;
+        }
+        if (READ_ONCE(cetrafs_window_read_no_retry))
+            break;
+        if (attempt + 1 < CETRAFS_WINDOW_READ_TRIES)
+            cetrafs_tear_backoff(attempt);
+    }
+    kfree(raw);
+    return ret;
+}
+
+static atomic64_t cetrafs_deferred_window_unverified = ATOMIC64_INIT(0);
+
 static void cetrafs_deferred_window_check(struct super_block *sb, struct buffer_head **bhs, const bool *written,
                                           const u32 *wcrc, unsigned int n,
                                           const struct cetrafs_journal_owner *o, u64 seq_before, u64 claimed)
 {
-    u64 seq_after;
+    u64 seq_after = 0;
     u32 me = 0;
     void *buf;
     unsigned int i;
     bool lost = false;
+    int unread = 0, r;
 
     if (READ_ONCE(cetrafs_late_flush_unverified) || cetrafs_sb_get_node_id(sb, &me))
         return;
+    /*
+     * A mismatch is a loss: a peer wrote inside the window. A read that
+     * FAILED says nothing about one -- the device that has just taken
+     * the writes refused a read -- and counted as a loss it marked a
+     * healthy file damaged, every later write refused (N-7). Each read
+     * is retried with the tear backoff; one that never succeeds leaves
+     * the window unverified: said and counted, not called damage.
+     */
     buf = kmalloc(CETRAFS_BLOCK_SIZE, GFP_NOFS);
-    lost = !buf;
+    if (!buf)
+        unread = -ENOMEM;
     for (i = 0; buf && i < n && !lost; i++) {
-        struct buffer_head *bh = bhs[i];
-
         if (!written[i])
             continue;
-        if (bdev_rw_virt(bh->b_bdev, bh->b_blocknr * (bh->b_size >> SECTOR_SHIFT), buf, CETRAFS_BLOCK_SIZE,
-                         REQ_OP_READ) ||
-            ~crc32c(~0U, buf, CETRAFS_BLOCK_SIZE) != wcrc[i])
+        r = cetrafs_window_read_block(bhs[i], buf, wcrc[i]);
+        if (r > 0)
             lost = true;
+        else if (r < 0 && !unread)
+            unread = r;
     }
     kfree(buf);
-    if (!lost && claimed) {
-        lost = cetrafs_deferred_file_seq(sb, o) != claimed;
-    } else if (!lost && seq_before) {
-        /* Unclaimed: an unknown "before" would make any peer's last
-         * stamp read as new. */
-        seq_after = cetrafs_deferred_file_seq(sb, o);
-        if (!seq_after || (seq_after != seq_before && CETRAFS_FILE_SEQ_NODE(seq_after) != (me & 0xFFFFu)))
-            lost = true;
+    if (!lost && (claimed || seq_before)) {
+        r = cetrafs_window_read_stamp(sb, o, &seq_after);
+        if (r) {
+            if (!unread)
+                unread = r;
+        } else if (claimed) {
+            lost = seq_after != claimed;
+        } else {
+            /* Unclaimed: an unknown "before" would make any peer's last
+             * stamp read as new. */
+            if (!seq_after || (seq_after != seq_before && CETRAFS_FILE_SEQ_NODE(seq_after) != (me & 0xFFFFu)))
+                lost = true;
+        }
+    }
+    if (!lost && unread && READ_ONCE(cetrafs_window_read_no_retry))
+        lost = true; /* test-only: the old judgement */
+    if (!lost && unread) {
+        atomic64_inc(&cetrafs_deferred_window_unverified);
+        pr_warn("ino=%llu: what a tree flush wrote could not be read back -- not verified that no other node "
+                "wrote the file inside it (%d); not marked damaged\n",
+                (unsigned long long) o->ino, unread);
+        return;
     }
     if (!lost)
         return;
