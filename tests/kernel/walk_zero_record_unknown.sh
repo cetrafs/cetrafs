@@ -37,6 +37,7 @@ ct_param_set scrub 0
 ct_param_set scrub_interval_secs 3
 ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 2
+ct_param_set trim_quarantine_secs 1 # else the mount's re-attach holds the scrub off for 600 s
 ct_param_set hb_interval_secs 1
 ct_param_set stale_secs "$TEST_STALE_SECS"
 P=/sys/module/cetrafs/parameters
