@@ -161,6 +161,20 @@ Stage 2 found three classes behind the checksums:
   seeds -- 0 findings, incl. the former crash seed 40404 now 3000 clean
   and journal-replay 2000 clean.
 
+## Seeds that found something (`seeds.txt`)
+
+A run without an explicit seed picks a random one, which is good for new
+coverage and no use as a regression net: a seed that once found a bug was
+checked again only if someone remembered it. Every fuzz script now first
+replays the seeds `seeds.txt` lists for its mode (`seeds.sh`), each for
+the iterations that reach its finding, and only then runs its random
+seed. A listed seed that fails again stops the stage and rewrites its
+own "last failed" date in `seeds.txt`; commit that. Add a line for every
+finding, with its first-found date. When the list grows too long, prune
+the lines whose last failure is oldest. A seed given on the command line
+is a deliberate reproduction and skips the list, as does
+`CETRAFS_FUZZ_NO_SEED_REPLAY=1`.
+
 ## Known limits / next stage
 
 The crafter builds depth-0, depth-1 AND depth-2 trees (variants 0-5

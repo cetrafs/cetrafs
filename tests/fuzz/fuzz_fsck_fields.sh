@@ -21,5 +21,11 @@ if [ ! -f "$WORK/golden.img" ] || [ "$ROOT/include/cetrafs.h" -nt "$WORK/golden.
    || [ "$HERE/mkgolden.sh" -nt "$WORK/golden.img" ]; then
     "$HERE/mkgolden.sh" "$WORK/golden.img"
 fi
+# Seeds that found something before, first (seeds.txt); not when a
+# seed was given: that run is a deliberate reproduction.
+. "$HERE/seeds.sh"
+if [ -z "${2:-}" ]; then
+    fuzz_replay_seeds fsck-fields "$WORK/golden.img" --fsck "$WORK/fsck.asan" --restamp "$WORK/fuzz_restamp" --findings "$WORK/findings-fsck-fields"
+fi
 python3 "$HERE/fuzz.py" fsck-fields "$WORK/golden.img" --iters "$ITERS" --seed "$SEED" \
     --fsck "$WORK/fsck.asan" --restamp "$WORK/fuzz_restamp" --findings "$WORK/findings-fsck-fields"

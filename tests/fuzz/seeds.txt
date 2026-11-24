@@ -1,0 +1,17 @@
+# Fuzz seeds that produced a finding, replayed by every fuzz stage before
+# its random run (tests/fuzz/seeds.sh). A failure is always meaningful:
+# a seed that found something once is checked again on every run, not
+# only when someone remembers it.
+#
+# One line per seed:
+#   <fuzzer> <seed> <iters> <first found, UTC> <last failed, UTC> <note>
+# <fuzzer> is the fuzz.py mode (fsck, fsck-fields, mount, mount-fields);
+# <iters> reaches the finding, a little past its iteration. A replay that
+# fails again rewrites <last failed> itself -- commit that change.
+#
+# A seed reproduces its exact sequence only while the golden image and
+# fuzz.py's choices stay as they were; after they change it is still a
+# fixed, cheap sequence that once mattered. Pruning: when the list grows
+# too long, drop the lines whose <last failed> is oldest -- a seed that
+# has not failed for months is the first to go.
+mount-fields 113183145 110 2026-11-24T01:33Z 2026-11-24T09:30Z damaged ZG record: per-ENOSPC re-read (iter 14, f82f83e7); 240 s identity watch read as a mount hang (iter 103, fuzzer budget)

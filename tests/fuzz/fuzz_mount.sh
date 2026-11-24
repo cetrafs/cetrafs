@@ -35,5 +35,11 @@ if ! lsmod | grep -q '^cetrafs '; then
     # its assertion (measured, not hypothetical).
     trap 'rmmod cetrafs 2>/dev/null || true' EXIT
 fi
+# Seeds that found something before, first (seeds.txt); not when a
+# seed was given: that run is a deliberate reproduction.
+. "$HERE/seeds.sh"
+if [ -z "${2:-}" ]; then
+    fuzz_replay_seeds mount "$WORK/golden.img" --restamp "$WORK/sb_restamp" --findings "$WORK/findings-mount" --mnt "$WORK/mnt"
+fi
 python3 "$HERE/fuzz.py" mount "$WORK/golden.img" --iters "$ITERS" --seed "$SEED" \
     --restamp "$WORK/sb_restamp" --findings "$WORK/findings-mount" --mnt "$WORK/mnt"
