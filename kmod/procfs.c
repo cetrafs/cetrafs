@@ -561,7 +561,9 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
 
         if (cetrafs_proc_sweep_stop(m, sb))
             break;
-        ret = cetrafs_zg_get_info(sb, z, &info);
+        /* Unmarked: a record repaired a moment ago shows as repaired,
+         * not as the allocator's 30 s mark of it (zonegroup.c). */
+        ret = cetrafs_zg_get_info_unmarked(sb, z, &info);
         if (ret) {
             /* Degrade, do not abort: the fields above this point are
              * answerable from memory and must survive a device that has

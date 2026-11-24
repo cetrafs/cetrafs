@@ -25,7 +25,7 @@ RULE="$(grep -E "^[[:space:]]+echo '\\\$\(VERSION\)' > debian/cetrafs-dkms/usr/s
     { fail "setup: debian/rules does not write kmod/VERSION"; ct_exit; }
 
 T="$(mktemp -d)"
-trap 'rm -rf "$T"' EXIT
+ct_track cmd "rm -rf '$T'"
 cp -a "$ROOT/kmod" "$ROOT/include" "$T/"
 find "$T/kmod" \( -name '*.o' -o -name '*.ko' -o -name '.*.cmd' -o -name '*.mod' -o -name '*.mod.c' \) -delete
 git -C "$T/kmod" rev-parse 2>/dev/null && { fail "setup: the copy is inside a git tree"; ct_exit; }

@@ -116,11 +116,12 @@ u64 cetrafs_zg_copy_torn_count(void)
     return (u64) atomic64_read(&cetrafs_zg_copy_torn);
 }
 
-static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group_t *out, bool first_cached);
+static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group_t *out, bool first_cached,
+                             bool use_mark);
 
 static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group_t *out)
 {
-    return __cetrafs_read_zg(sb, zg_id, out, false);
+    return __cetrafs_read_zg(sb, zg_id, out, false, true);
 }
 
 /* TEST ONLY: whole-table sweeps read each Zone Group record (statfs, the
@@ -167,7 +168,7 @@ int cetrafs_zg_get_info_prefetched(struct super_block *sb, u32 zg_id, struct cet
 
     if (!zg)
         return -ENOMEM;
-    ret = __cetrafs_read_zg(sb, zg_id, zg, true);
+    ret = __cetrafs_read_zg(sb, zg_id, zg, true, true);
     if (!ret) {
         out->owner_node_id = le16_to_cpu(zg->owner_node_id);
         out->free_data_blocks = le64_to_cpu(zg->free_data_blocks);
@@ -230,7 +231,8 @@ static int cetrafs_sr_zg(struct buffer_head *bh, void *ctx)
     return CETRAFS_SR_TORN;
 }
 
-static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group_t *out, bool first_cached)
+static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group_t *out, bool first_cached,
+                             bool use_mark)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     struct cetrafs_sr_zg_ctx c = {.out = out, .zg_id = zg_id, .unlocked = READ_ONCE(cetrafs_zg_read_unlocked)};
@@ -243,7 +245,7 @@ static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_gro
         return -EINVAL;
     /* Marked unreadable a moment ago: answered from the mark, not with
      * another quarter second of re-reads (cetrafs_sb_zg_unreadable_skip()). */
-    if (!READ_ONCE(cetrafs_zg_unreadable_fatal) && !cetrafs_sb_zg_owned_cached(sb, zg_id) &&
+    if (use_mark && !READ_ONCE(cetrafs_zg_unreadable_fatal) && !cetrafs_sb_zg_owned_cached(sb, zg_id) &&
         cetrafs_sb_zg_unreadable_skip(sb, zg_id))
         return -EUCLEAN;
 
@@ -427,7 +429,7 @@ static int cetrafs_zg_cas(struct super_block *sb, u32 zg_id, struct cetrafs_zg_c
  * above -- those read cetrafs_zone_group_t fields directly, each for
  * its own narrow purpose.
  */
-int cetrafs_zg_get_info(struct super_block *sb, u32 zg_id, struct cetrafs_zg_info *out)
+static int __cetrafs_zg_get_info(struct super_block *sb, u32 zg_id, struct cetrafs_zg_info *out, bool use_mark)
 {
     cetrafs_zone_group_t *zg = kmalloc(sizeof(*zg), GFP_KERNEL); /* heap, not stack -- see above */
     int ret;
@@ -435,7 +437,7 @@ int cetrafs_zg_get_info(struct super_block *sb, u32 zg_id, struct cetrafs_zg_inf
     if (!zg)
         return -ENOMEM;
 
-    ret = cetrafs_read_zg(sb, zg_id, zg);
+    ret = __cetrafs_read_zg(sb, zg_id, zg, false, use_mark);
     if (!ret) {
         out->owner_node_id = le16_to_cpu(zg->owner_node_id);
         out->free_data_blocks = le64_to_cpu(zg->free_data_blocks);
@@ -444,6 +446,23 @@ int cetrafs_zg_get_info(struct super_block *sb, u32 zg_id, struct cetrafs_zg_inf
 
     kfree(zg);
     return ret;
+}
+
+int cetrafs_zg_get_info(struct super_block *sb, u32 zg_id, struct cetrafs_zg_info *out)
+{
+    return __cetrafs_zg_get_info(sb, zg_id, out, true);
+}
+
+/*
+ * The same, always from the device: a record marked unreadable is read
+ * again rather than answered from the mark. For the procfs view, whose
+ * reader has just repaired the record or is checking whether it is
+ * damaged; the mark exists for the allocator's ENOSPC scans, which ask
+ * for every record per failed block (cetrafs_sb_zg_unreadable_skip()).
+ */
+int cetrafs_zg_get_info_unmarked(struct super_block *sb, u32 zg_id, struct cetrafs_zg_info *out)
+{
+    return __cetrafs_zg_get_info(sb, zg_id, out, false);
 }
 
 /*

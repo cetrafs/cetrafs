@@ -1713,6 +1713,7 @@ struct cetrafs_zg_info {
      * docs/internal/BG-OWNERSHIP-DESIGN.md */
 };
 int cetrafs_zg_get_info(struct super_block *sb, u32 zg_id, struct cetrafs_zg_info *out);
+int cetrafs_zg_get_info_unmarked(struct super_block *sb, u32 zg_id, struct cetrafs_zg_info *out);
 bool cetrafs_zg_prefetch_all(struct super_block *sb);
 extern bool cetrafs_zg_prefetch_off; /* test-only */
 int cetrafs_zg_get_info_prefetched(struct super_block *sb, u32 zg_id, struct cetrafs_zg_info *out);
