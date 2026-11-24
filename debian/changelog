@@ -1,3 +1,61 @@
+cetrafs (0.10.2) unstable; urgency=medium
+
+  * Fix: on nofilelock mounts the background defragmenter ran, and kept
+    taking VM images while they were being written; a disk move into a
+    sparse image fell from hundreds of MB/s to a few. nofilelock disables
+    defragmentation again, as its mount message says, and defrag.cetra is
+    refused there. No format change: 0.10.1 volumes mount as they are.
+
+  * Fix: during a large copy a node gave back, every 15 seconds, the
+    unused part of the space it had just taken to write into, then ran
+    out and took more: stop-and-go writes and a large UNMAP each cycle.
+    Space a node is writing into is now kept for a grace period before it
+    goes back (procfs controls handback_grace=, 30 to 1800 seconds,
+    default 150), unless the volume is nearly full.
+
+  * Fix: a path lookup no longer drops a file's page cache unless the
+    file changed since it was cached.
+
+  * Fix: unmount after a journal write refused for lack of space leaves
+    cleanly instead of stopping the mount, and finishes queued lock
+    releases first.
+
+  * Fix: the file-lock-mode election at mount fences a peer it judged
+    dead, so a stalled node cannot resume in a mode the cluster left.
+
+  * Fix: a power cut during growfs, after the new superblock was written
+    and before its copy at block 2048, left fsck reporting an error and a
+    growfs re-run did not clear it. fsck now notes it, and the re-run or
+    fsck -r rewrites the copy.
+
+  * Fix: with a damaged Zone Group record, every allocation that ran out
+    of space re-read it with the full retry budget, over half a second
+    each. The record is now re-checked at most every 30 seconds.
+
+  * Fixes from a code review of the journal, allocator, scrub, trim and
+    directory paths, among them: a rename whose new name landed is never
+    undone into two names, a failed mkdir frees its block only once its
+    inode is dead, a directory's link count never drops below 2, and a
+    crash inside a Block Group claim no longer leaves df counting that
+    group as free.
+
+  * Packaging: a module built from the cetrafs-dkms package reports its
+    release in /sys/module/cetrafs/version and modinfo, instead of
+    "unknown".
+
+  * Robustness: checksummed records get the same torn-read retry budget
+    as data blocks; a damaged bitmap block, Zone Group record or registry
+    row is skipped by a scan instead of failing it. A repaired Zone Group
+    record shows as repaired in procfs at once, and an unmount whose lease
+    ran out says so in the log.
+
+  * fsck: reports duplicate and impossible directory names, gaps in a
+    directory's blocks, and file sizes past the format's ceiling; --live
+    runs on a volume this host has mounted, without false errors from
+    directories removed during the walk.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Tue, 24 Nov 2026 16:26:20 +0000
+
 cetrafs (0.10.1) unstable; urgency=medium
 
   * Format change: CETRAFS_VERSION moves from 0x0009 to 0x000A, so volumes
