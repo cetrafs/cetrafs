@@ -839,6 +839,11 @@ struct cetrafs_sb_info {
     /* jiffies before which a record marked there is not read again
      * (cetrafs_sb_zg_unreadable_skip()). */
     unsigned long zg_unreadable_until;
+    /* Per Zone Group: jiffies of this node's last claim or allocation in
+     * it, and how long its empty space stays after that before the
+     * heartbeat hands it back (cetrafs_sb_zg_in_handback_grace()). */
+    unsigned long zg_last_use[CETRAFS_MAX_ZONE_GROUPS];
+    unsigned int handback_grace_secs;
     /* Zone Groups a free found full under a dead owner: the heartbeat
      * adopts them (cetrafs_zg_adopt_wanted()), never the freeing thread,
      * which may hold inode_lock/invalidate_lock or run from reclaim. */
@@ -3476,6 +3481,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         INIT_LIST_HEAD(&sbi->resv_list);
         INIT_LIST_HEAD(&sbi->trim_quarantine);
         mutex_init(&sbi->pool_owed.lock);
+        sbi->handback_grace_secs = cetrafs_handback_grace_default();
         INIT_LIST_HEAD(&sbi->pool_owed.list);
 
         spin_lock_init(&sbi->peer_lock);
@@ -7833,7 +7839,11 @@ void cetrafs_sb_cache_zg_ownership(struct super_block *sb, u32 zg_id)
     if (zg_id >= CETRAFS_MAX_ZONE_GROUPS)
         return;
 
-    set_bit(zg_id, sbi->owned_zgs);
+    /* Newly ours: a claim is a use (the hand-back grace). Only on the
+     * transition -- the re-attach on every tick must not keep a Zone
+     * Group in its grace for ever. */
+    if (!test_and_set_bit(zg_id, sbi->owned_zgs))
+        cetrafs_sb_zg_touch(sb, zg_id);
 
     /* Derive "which Block Groups may this node allocate from" from the
      * owners recorded at mount, rather than from the Zone Group's
@@ -8205,8 +8215,86 @@ void cetrafs_sb_set_alloc_cursor(struct super_block *sb, u32 bg_id)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
-    if (sbi)
+    if (sbi) {
         WRITE_ONCE(sbi->alloc_bg_cursor, bg_id);
+        /* The allocator moved on to this group: its Zone Group is in
+         * use. Once per group, never per block. */
+        cetrafs_sb_zg_touch(sb, cetrafs_sb_bg_owner(sb, bg_id));
+    }
+}
+
+/*
+ * The hand-back grace (issue 13). The heartbeat gives back every empty
+ * Block Group of an owned Zone Group, and a node filling space fast --
+ * a disk move into a sparse image -- claimed a Zone Group, had most of
+ * it handed back (and UNMAPped) at the next beat, filled the few groups
+ * it kept, ran out and claimed the next: stop-and-go writes and one
+ * UNMAP burst the size of a Zone Group per cycle. A Zone Group this node
+ * claimed or allocated in within the grace keeps its empty groups; the
+ * heartbeat hands them back once the node has left it alone that long.
+ * Per mount, through procfs controls (handback_grace=<secs>); the
+ * module parameter is the value a new mount starts with. Both are held
+ * to CETRAFS_HANDBACK_GRACE_MIN_SECS..MAX_SECS (30 s .. 30 min): the
+ * space has to go back sooner or later, and a grace too short to span a
+ * beat is the churn again. There is no "off": only the test knob below
+ * turns it off, for the suites that drive a hand-back at once.
+ */
+static unsigned int cetrafs_handback_grace_secs_param = 150;
+module_param_named(handback_grace_secs, cetrafs_handback_grace_secs_param, uint, 0644);
+MODULE_PARM_DESC(handback_grace_secs,
+                 "seconds a Zone Group this node claimed or allocated in keeps its empty Block Groups (default 150; "
+                 "per mount: controls handback_grace=)");
+
+unsigned int cetrafs_handback_grace_default(void)
+{
+    return clamp_t(unsigned int, READ_ONCE(cetrafs_handback_grace_secs_param), CETRAFS_HANDBACK_GRACE_MIN_SECS,
+                   CETRAFS_HANDBACK_GRACE_MAX_SECS);
+}
+
+/* TEST ONLY: no Zone Group is ever in its hand-back grace -- the heartbeat
+ * hands empty groups back at the next beat, as before the grace existed.
+ * The harness loads with it set: most suites that free space assert on
+ * the hand-back that follows (tests/kernel/handback_grace.sh unsets it). */
+static bool cetrafs_handback_grace_off;
+cetrafs_test_param(handback_grace_off, cetrafs_handback_grace_off, bool, 0644);
+MODULE_PARM_DESC(handback_grace_off, "TEST ONLY: empty Block Groups are handed back at the next beat");
+
+void cetrafs_sb_zg_touch(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi && zg_id < CETRAFS_MAX_ZONE_GROUPS && READ_ONCE(sbi->zg_last_use[zg_id]) != jiffies)
+        WRITE_ONCE(sbi->zg_last_use[zg_id], jiffies);
+}
+
+bool cetrafs_sb_zg_in_handback_grace(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    unsigned long last;
+    unsigned int grace;
+
+    if (!sbi || zg_id >= CETRAFS_MAX_ZONE_GROUPS || sb_rdonly(sb))
+        return false; /* a read-only mount allocates nothing: no reason to keep anything */
+    if (READ_ONCE(cetrafs_handback_grace_off))
+        return false;
+    grace = READ_ONCE(sbi->handback_grace_secs);
+    last = READ_ONCE(sbi->zg_last_use[zg_id]);
+    return grace && last && time_before(jiffies, last + (unsigned long) grace * HZ);
+}
+
+unsigned int cetrafs_sb_handback_grace_secs(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi ? READ_ONCE(sbi->handback_grace_secs) : 0;
+}
+
+void cetrafs_sb_set_handback_grace_secs(struct super_block *sb, unsigned int secs)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi)
+        WRITE_ONCE(sbi->handback_grace_secs, secs);
 }
 
 /*

@@ -430,6 +430,7 @@ trim_quarantine_secs:how long a trimmed run of unknown discard outcome is held f
 space_wait_secs:how long an overwrite or a last close waits for a full thin pool before the mount stops; 0 waits without limit, the old behaviour -- no value frees or writes anything
 hb_interval_secs:heartbeat period for new mounts; clamped 1..3600 (cetrafs_param_hb_interval_secs)
 stale_secs:stale window for new mounts; refused above 240, clamped 3..240 and to >= 3 beats (cetrafs_param_stale_secs)
+handback_grace_secs:how long a Zone Group in use keeps its empty Block Groups for new mounts; clamped 30..1800 (cetrafs_handback_grace_default); space only, a kept group stays owned by this node either way
 node_uuid:load-time only (0444): this node identity
 pf_full_backoff_ms:pending-free queue backoff (latency)
 pf_drain_min_ms:pending-free drain rate limit (latency)
@@ -3384,7 +3385,7 @@ rm -rf "$TK_P"
 # the scan above. So every parameter outside the lock is a production
 # tunable named here; a new one fails until it is judged and listed.
 TK_PROD="alloc_run_blocks alloc_run_max_blocks auto_defrag auto_defrag_min_extents auto_defrag_min_pct
-auto_defrag_quiet_secs bg_sweep_min_secs caw_probe dio_fill_holes ext_cache hb_interval_secs lock_yield_wait_ms
+auto_defrag_quiet_secs bg_sweep_min_secs caw_probe dio_fill_holes ext_cache handback_grace_secs hb_interval_secs lock_yield_wait_ms
 node_uuid own_claim_resweep_secs pf_drain_min_ms pf_full_backoff_ms scrub scrub_gap_secs scrub_interval_secs
 space_wait_secs stale_secs trim_quarantine_secs"
 tk_unlocked() {

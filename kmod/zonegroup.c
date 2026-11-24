@@ -2358,11 +2358,65 @@ int cetrafs_zg_release_surplus(struct super_block *sb, u32 my_node_id)
     return ret;
 }
 
+/*
+ * Does the volume still have room a peer can claim without this node's
+ * help: unowned Block Groups (the pool shards) plus the free space of
+ * Zone Groups nobody owns, at least 1/CETRAFS_HANDBACK_GRACE_POOL_FRAC
+ * of the data capacity? The hand-back grace keeps empty groups parked on
+ * this node, and on a nearly full volume those are exactly what a peer
+ * runs out of: there the grace is waived and the space goes back at the
+ * next beat, as it did before the grace existed.
+ *
+ * One batched fresh read of the Zone Group table, and only on a pass
+ * that has a Zone Group in its grace. Anything unreadable answers "no
+ * room": a wrong "no room" costs one early hand-back, a wrong "room"
+ * costs a peer an ENOSPC.
+ */
+#define CETRAFS_HANDBACK_GRACE_POOL_FRAC 20U /* 5% */
+static bool cetrafs_zg_pool_has_room(struct super_block *sb)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u64 total = cetrafs_sb_total_data_blocks(sb), room = 0;
+    bool prefetched;
+    u32 zg_count, z;
+
+    if (!raw_sb || !total)
+        return false;
+    zg_count = le32_to_cpu(raw_sb->zone_group_count);
+    prefetched = cetrafs_zg_prefetch_all(sb);
+    for (z = 0; z < zg_count; z++) {
+        struct cetrafs_zg_info zi;
+        int ret = prefetched ? cetrafs_zg_get_info_prefetched(sb, z, &zi) : cetrafs_zg_get_info(sb, z, &zi);
+
+        if (ret == -EUCLEAN)
+            continue; /* a damaged record: nobody can claim its space */
+        if (ret)
+            return false;
+        room += zi.pool_free_blocks;
+        if (zi.owner_node_id == CETRAFS_NODE_ID_NONE)
+            room += zi.free_data_blocks;
+        cond_resched();
+    }
+    return room >= div_u64(total, CETRAFS_HANDBACK_GRACE_POOL_FRAC);
+}
+
+/* The grace for one pass: in it, and the volume has room (above); the
+ * room is read once per pass and only when some Zone Group asks. */
+static bool cetrafs_zg_keep_for_grace(struct super_block *sb, u32 zg_id, int *room)
+{
+    if (!cetrafs_sb_zg_in_handback_grace(sb, zg_id))
+        return false;
+    if (*room < 0)
+        *room = cetrafs_zg_pool_has_room(sb);
+    return *room > 0;
+}
+
 static int cetrafs_zg_release_surplus_locked(struct super_block *sb, u32 my_node_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 zg_count, z, owned_count = 0, deferred = 0;
     unsigned long pass_started = 0;
+    int room = -1; /* cetrafs_zg_keep_for_grace(): not read yet */
     int ret;
 
     if (!raw_sb)
@@ -2393,7 +2447,12 @@ static int cetrafs_zg_release_surplus_locked(struct super_block *sb, u32 my_node
 
         if (!cetrafs_sb_zg_owned_cached(sb, z))
             continue;
-        if (cetrafs_bg_release_empty(sb, z, &freed, &held, &pass_started) == 0 && freed)
+        /* In its hand-back grace (claimed or allocated in lately) on a
+         * volume with room: its empty groups stay, its outstanding
+         * discards are still seen to (cetrafs_sb_zg_in_handback_grace()). */
+        if (cetrafs_bg_release_empty(sb, z, cetrafs_zg_keep_for_grace(sb, z, &room), &freed, &held, &pass_started) ==
+                0 &&
+            freed)
             pr_info("ZG %u: handed back %u empty Block Group(s)\n", z, freed);
         deferred += held;
     }
@@ -2425,6 +2484,10 @@ static int cetrafs_zg_release_surplus_locked(struct super_block *sb, u32 my_node
         bool empty, did_release;
 
         if (!cetrafs_sb_zg_owned_cached(sb, z))
+            continue;
+        /* Claimed or allocated in lately: kept, empty or not -- the
+         * stop-and-go of issue 13 gave back whole Zone Groups too. */
+        if (cetrafs_zg_keep_for_grace(sb, z, &room))
             continue;
 
         ret = cetrafs_zg_is_fully_empty(sb, z, &empty);
@@ -4243,6 +4306,9 @@ retry_scan:
             ret = cetrafs_bg_claim_free(sb, mine, &got);
             cetrafs_sb_release_read_unlock(sb);
             if (ret == 0) {
+                /* Claimed to be filled: the hand-back grace. Here, not in
+                 * the claim itself, which FITRIM's pool pass also uses. */
+                cetrafs_sb_zg_touch(sb, mine);
                 pr_info("alloc: out of space in owned Block Groups, claimed free BG %u into ZG %u\n", got, mine);
                 goto retry_scan;
             }

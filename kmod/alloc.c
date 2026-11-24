@@ -5858,8 +5858,8 @@ u64 cetrafs_release_visit_count(void)
     return (u64) atomic64_read(&cetrafs_release_visits);
 }
 
-int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released, u32 *out_deferred,
-                             unsigned long *pass_started)
+int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, bool keep_empty, u32 *out_released,
+                             u32 *out_deferred, unsigned long *pass_started)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 b, nbg, released = 0, deferred = 0;
@@ -5883,7 +5883,12 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
      * (audit 2026-11-14 P13). The mark is cleared only where the look
      * below finds the group in use; a later credit sets it again.
      */
-    for (b = READ_ONCE(cetrafs_release_walk_all) ? 0 : cetrafs_sb_next_release_check(sb, 0); b < nbg;
+    /* keep_empty: the Zone Group is in its hand-back grace -- no empty
+     * group is given back; the marks stay for the pass that will. */
+    for (b = keep_empty                          ? nbg
+             : READ_ONCE(cetrafs_release_walk_all) ? 0
+                                                   : cetrafs_sb_next_release_check(sb, 0);
+         b < nbg;
          b = READ_ONCE(cetrafs_release_walk_all) ? b + 1 : cetrafs_sb_next_release_check(sb, b + 1)) {
         u64 total, free;
         int ret;

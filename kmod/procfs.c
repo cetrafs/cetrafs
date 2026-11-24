@@ -786,6 +786,10 @@ static int cetrafs_proc_controls_show(struct seq_file *m, void *v)
                                                      : "yes (nofilelock: a file no peer has open)");
     seq_printf(m, "hb_interval_secs: %u\n", cetrafs_sb_hb_interval_secs(sb));
     seq_printf(m, "stale_secs: %u\n", cetrafs_sb_stale_secs(sb));
+    /* How long a Zone Group this node claimed or allocated in keeps its
+     * empty Block Groups before the heartbeat hands them back (and
+     * UNMAPs them): handback_grace=<secs>, 30 .. 1800. */
+    seq_printf(m, "handback_grace_secs: %u\n", cetrafs_sb_handback_grace_secs(sb));
     seq_printf(m, "shutdown: %s\n", cetrafs_sb_is_fenced(sb) ? "yes" : "no");
     /* The automatic UNMAP at Block Group hand-back (discard.c), and
      * whether the device takes discards at all -- "on" over a device
@@ -988,6 +992,23 @@ timing_out:
         n = cetrafs_sb_waive_pending_discards(sb);
         pr_warn("%s: controls: %u Block Group(s) held for an outstanding discard released on the operator's word\n",
                 sb->s_id, n);
+        return len;
+    }
+
+    /* handback_grace=<secs>: how long a Zone Group this node claimed or
+     * allocated in keeps its empty Block Groups before they are handed
+     * back (cetrafs_sb_zg_in_handback_grace()). 30 s .. 30 min: below,
+     * a fast writer churns again; above, an idle node parks capacity its
+     * peers need. Space only, never safety: a kept group is this node's
+     * either way. */
+    if (!strcmp(key, "handback_grace")) {
+        unsigned int v;
+
+        if (kstrtouint(val, 10, &v) || v < CETRAFS_HANDBACK_GRACE_MIN_SECS ||
+            v > CETRAFS_HANDBACK_GRACE_MAX_SECS)
+            return -EINVAL;
+        cetrafs_sb_set_handback_grace_secs(sb, v);
+        pr_info("%s: controls: handback_grace -> %u s\n", sb->s_id, v);
         return len;
     }
 

@@ -351,6 +351,16 @@ u32 cetrafs_sb_zg_unreadable_count(struct super_block *sb);
 bool cetrafs_sb_zg_unreadable_skip(struct super_block *sb, u32 zg_id);
 void cetrafs_sb_zg_unreadable_rearm(struct super_block *sb);
 void cetrafs_sb_zg_note_readable(struct super_block *sb, u32 zg_id);
+/* fs.c: the hand-back grace (cetrafs_sb_zg_in_handback_grace()). Its
+ * bounds: never so short that a fast writer
+ * churns, never so long that space a peer needs stays parked. */
+#define CETRAFS_HANDBACK_GRACE_MIN_SECS 30U
+#define CETRAFS_HANDBACK_GRACE_MAX_SECS 1800U
+unsigned int cetrafs_handback_grace_default(void);
+void cetrafs_sb_zg_touch(struct super_block *sb, u32 zg_id);
+bool cetrafs_sb_zg_in_handback_grace(struct super_block *sb, u32 zg_id);
+unsigned int cetrafs_sb_handback_grace_secs(struct super_block *sb);
+void cetrafs_sb_set_handback_grace_secs(struct super_block *sb, unsigned int secs);
 extern bool cetrafs_zg_unreadable_fatal;
 bool cetrafs_sb_zg_pf_backoff_active(struct super_block *sb, u32 zg_id);
 bool cetrafs_sb_zg_pf_residue(struct super_block *sb, u32 zg_id);
@@ -1488,8 +1498,8 @@ void cetrafs_bg_refresh_owner_map(struct super_block *sb);
  * docs/internal/BG-OWNERSHIP-DESIGN.md */
 /* pass_started: 0 before a heartbeat pass's first call, then left to the
  * callee -- the hand-back discard budget runs per pass (discard.c). */
-int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released, u32 *out_deferred,
-                             unsigned long *pass_started);
+int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, bool keep_empty, u32 *out_released,
+                             u32 *out_deferred, unsigned long *pass_started);
 bool cetrafs_sb_drain_bg(struct super_block *sb, u32 bg_id);
 void cetrafs_sb_undrain_bg(struct super_block *sb, u32 bg_id);
 

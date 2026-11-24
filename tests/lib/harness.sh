@@ -910,7 +910,7 @@ require_module() {
         # loop device there is no atomic CAW, so this covers the no-CAW
         # fallback -- the path real hardware never takes, and therefore the
         # one nothing else exercises.
-        if ! insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 "$@" 2>/dev/null; then
+        if ! insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 handback_grace_off=1 "$@" 2>/dev/null; then
             # "File exists" here is the previous suite's rmmod still
             # settling: delete_module can return before the module is fully
             # out of the kernel's list, so this insmod races it. Wait for
@@ -934,7 +934,7 @@ require_module() {
             why=""
             for _try in $(seq 1 30); do
                 lsmod | grep -q '^cetrafs ' && { sleep 1; continue; }
-                why="$(insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 "$@" 2>&1)" && { loaded=1; break; }
+                why="$(insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 handback_grace_off=1 "$@" 2>&1)" && { loaded=1; break; }
                 # "File exists" is not a failure to diagnose, it is the
                 # kernel telling us a module of this name IS present --
                 # whatever lsmod says. ADOPT it: proceed, and leave
@@ -960,7 +960,7 @@ require_module() {
                                 [ -d /sys/module/cetrafs ] || break
                                 sleep 0.2
                             done
-                            why="$(insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 "$@" 2>&1)" &&
+                            why="$(insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 handback_grace_off=1 "$@" 2>&1)" &&
                                 { loaded=1; break; }
                         fi
                         # Could not take it over (in use, or it will not
@@ -997,6 +997,9 @@ require_module() {
             # checks the selftest ran), and it is writable 0644 because
             # it is consulted per mount rather than at load.
             echo 1 >/sys/module/cetrafs/parameters/cas_selftest 2>/dev/null || true
+            # The suites that drive a hand-back expect it at the next beat
+            # (handback_grace.sh turns the grace back on for itself).
+            echo 1 >/sys/module/cetrafs/parameters/handback_grace_off 2>/dev/null || true
             # Anything else the caller asked for cannot be applied to a
             # module we did not load -- say so rather than run a suite
             # under parameters it did not get.
