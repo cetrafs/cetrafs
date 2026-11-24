@@ -17,7 +17,8 @@
 # odd MiB first and then the even ones, as an out-of-order copy leaves
 # it fragmented; then it stays open a few seconds, as a VM keeps its
 # disk:
-#   setup: the image fragmented (the janitor's threshold was reached);
+#   setup: the image fragmented in the fixed round (the janitor's
+#          threshold was reached);
 #   1. no defrag pass ran, and nothing was pinned;
 #   2. defrag.cetra is refused, and procfs says defrag is not available;
 #   3. the content is what was written; fsck clean.
@@ -93,8 +94,11 @@ log "fixed: $R"
 round c 1
 C="$RES"
 log "control (defrag_nofilelock=1): $C"
-[ "$(get extents "$R")" -ge 8 ] && [ "$(get extents "$C")" -ge 2 ] ||
-    { fail "setup: the image did not fragment ($R / $C)"; ct_exit; }
+# Fragmentation is the fixed round's to show: in the control the janitor
+# is allowed and may well have merged the image by the time it is
+# measured -- that is the control working, and its passes say so.
+[ "$(get extents "$R")" -ge 8 ] ||
+    { fail "setup: the image did not fragment ($R)"; ct_exit; }
 [ "$(get passes "$R")" = 0 ] && [ "$(get pinned "$R")" = 0 ] &&
     pass "1: no defrag pass took the image being filled ($R)" || fail "1: $R"
 [ "$(get manual_rc "$R")" != 0 ] && [ "$(get avail "$R")" = no ] &&
