@@ -117,7 +117,13 @@ endif
 # set of uncommitted changes then gets its own stamp, which is what makes
 # "did my rebuild actually reach every node?" answerable from dmesg/modinfo.
 CETRAFS_SRCDIR := $(if $(src),$(src),$(CURDIR))
-CETRAFS_GIT_DESC := $(shell git -C $(CETRAFS_SRCDIR) describe --tags --always --dirty 2>/dev/null || echo unknown)
+# Outside a git tree -- the DKMS source a package installs under
+# /usr/src/cetrafs-<ver> is one -- the release the package was built as,
+# from kmod/VERSION, which debian/rules writes from debian/changelog. Only
+# with neither is it "unknown": every packaged module used to report
+# "unknown+src.<hash>", the release nowhere in it.
+CETRAFS_PKG_VERSION := $(shell cat $(CETRAFS_SRCDIR)/VERSION 2>/dev/null | head -1 | tr -cd 'A-Za-z0-9.~+:-')
+CETRAFS_GIT_DESC := $(shell git -C $(CETRAFS_SRCDIR) describe --tags --always --dirty 2>/dev/null || echo $(or $(CETRAFS_PKG_VERSION),unknown))
 CETRAFS_DIRTY_HASH := $(if $(findstring -dirty,$(CETRAFS_GIT_DESC)),.$(shell git -C $(CETRAFS_SRCDIR) diff HEAD 2>/dev/null | sha1sum | cut -c1-8),)
 # What a multi-node test must compare is the SOURCE, not the binary: two
 # hypervisors on different kernel builds need two .ko files, which can
@@ -149,3 +155,9 @@ clean:
 
 format:
 	bash -c 'clang-format -i *.{c,h}'
+
+# The stamp the module will carry, without building it
+# (tests/image/dkms_version_stamp.sh).
+.PHONY: print-version
+print-version:
+	@echo $(CETRAFS_BUILD_VERSION)
