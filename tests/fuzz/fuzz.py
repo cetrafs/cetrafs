@@ -509,6 +509,15 @@ t(lambda: os.statvfs(m))
 # A timeout earns one patient retry; only a second one is a hang.
 FSCK_PATIENT_SECS = 15 + 2 * (2 * 30 + 5)
 
+# A mount watches a registry row that carries this machine's identity
+# and was not left cleanly for the stale window that row ADVERTISES
+# (twin-watch, kmod/node.c), and a row may legally advertise up to
+# CETRAFS_STALE_MAX_SECS = 240 s (include/cetrafs.h). A mutated row that
+# does so is a correct 240 s wait, not a hang: the old 150 s budget,
+# written for a 120 s window, called it one (seed 113183145, iteration
+# 103). The budget is that ceiling plus a minute.
+MOUNT_PATIENT_SECS = 240 + 60
+
 
 def run_fsck(args, loop, env):
     rc, out = run([args.fsck, loop], 15, env=env)
@@ -610,7 +619,7 @@ def run_stage2(args, rng, fd, loop, env, t0, targets):
             with open("/dev/kmsg", "w") as k:
                 k.write(marker + "\n")
             run(["blockdev", "--flushbufs", loop], 10)
-            rc, _ = run(["mount", "-t", "cetrafs", loop, args.mnt], 150)  # gate may wait up to the clamped live-peer window (~120s)
+            rc, _ = run(["mount", "-t", "cetrafs", loop, args.mnt], MOUNT_PATIENT_SECS)
             if rc == "TIMEOUT":
                 why = "mount hang"
             elif rc == 0:
@@ -785,7 +794,7 @@ def run_loop(args, rng, mut, fd, loop, env, t0):
             with open("/dev/kmsg", "w") as k:
                 k.write(marker + "\n")
             run(["blockdev", "--flushbufs", loop], 10)
-            rc, out = run(["mount", "-t", "cetrafs", loop, args.mnt], 30)
+            rc, out = run(["mount", "-t", "cetrafs", loop, args.mnt], MOUNT_PATIENT_SECS)
             if rc == "TIMEOUT":
                 why = "mount hang"
             elif rc == 0:
