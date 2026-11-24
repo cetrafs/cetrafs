@@ -836,6 +836,9 @@ struct cetrafs_sb_info {
     /* Zone Group records found unreadable (cetrafs_sb_zg_note_unreadable()):
      * reported once each, then left out of every claim. */
     DECLARE_BITMAP(zg_unreadable, CETRAFS_MAX_ZONE_GROUPS);
+    /* jiffies before which a record marked there is not read again
+     * (cetrafs_sb_zg_unreadable_skip()). */
+    unsigned long zg_unreadable_until;
     /* Zone Groups a free found full under a dead owner: the heartbeat
      * adopts them (cetrafs_zg_adopt_wanted()), never the freeing thread,
      * which may hold inode_lock/invalidate_lock or run from reclaim. */
@@ -7877,6 +7880,51 @@ bool cetrafs_sb_zg_note_unreadable(struct super_block *sb, u32 zg_id)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     return sbi && zg_id < CETRAFS_MAX_ZONE_GROUPS && !test_and_set_bit(zg_id, sbi->zg_unreadable);
+}
+
+/* TEST ONLY: a record marked unreadable is read again, with the whole
+ * tear budget, every time it is asked for -- as before
+ * (tests/kernel/zg_damaged_enospc_fast.sh). */
+static bool cetrafs_zg_unreadable_recheck_always;
+cetrafs_test_param(zg_unreadable_recheck_always, cetrafs_zg_unreadable_recheck_always, bool, 0644);
+MODULE_PARM_DESC(zg_unreadable_recheck_always, "TEST ONLY: re-read a Zone Group record marked unreadable every time");
+
+/*
+ * A record marked unreadable is answered from the mark for a while
+ * instead of read again. Each read of one pays the whole tear budget
+ * (cetrafs_read_stable()), about a quarter of a second, and the
+ * allocator asks for every record on every ENOSPC: a node that owned no
+ * group behind one damaged record took half a second per failed block.
+ * Every CETRAFS_ZG_UNREADABLE_RECHECK_SECS one read does go to the
+ * device, so a record misjudged -- a tear that outlasted the budget --
+ * is taken back (cetrafs_sb_zg_note_readable()).
+ */
+#define CETRAFS_ZG_UNREADABLE_RECHECK_SECS 30
+
+bool cetrafs_sb_zg_unreadable_skip(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && zg_id < CETRAFS_MAX_ZONE_GROUPS && !READ_ONCE(cetrafs_zg_unreadable_recheck_always) &&
+           test_bit(zg_id, sbi->zg_unreadable) && time_before(jiffies, READ_ONCE(sbi->zg_unreadable_until));
+}
+
+/* A marked record was read again and is still damaged. */
+void cetrafs_sb_zg_unreadable_rearm(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi)
+        WRITE_ONCE(sbi->zg_unreadable_until, jiffies + CETRAFS_ZG_UNREADABLE_RECHECK_SECS * HZ);
+}
+
+/* A marked record verified: the mark was a tear's, not damage. */
+void cetrafs_sb_zg_note_readable(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi && zg_id < CETRAFS_MAX_ZONE_GROUPS && test_and_clear_bit(zg_id, sbi->zg_unreadable))
+        pr_info("ZG %u: its record verifies again -- no longer left alone\n", zg_id);
 }
 
 u32 cetrafs_sb_zg_unreadable_count(struct super_block *sb)

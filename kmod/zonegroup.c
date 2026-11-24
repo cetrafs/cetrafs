@@ -241,6 +241,11 @@ static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_gro
         return -EINVAL;
     if (zg_id >= le32_to_cpu(raw_sb->zone_group_count))
         return -EINVAL;
+    /* Marked unreadable a moment ago: answered from the mark, not with
+     * another quarter second of re-reads (cetrafs_sb_zg_unreadable_skip()). */
+    if (!READ_ONCE(cetrafs_zg_unreadable_fatal) && !cetrafs_sb_zg_owned_cached(sb, zg_id) &&
+        cetrafs_sb_zg_unreadable_skip(sb, zg_id))
+        return -EUCLEAN;
 
     /* Checksum-mismatch retries: ZG records are written
      * synced under the cluster mutex (claims/releases) or by their owner
@@ -251,6 +256,8 @@ static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_gro
      * is real corruption (cetrafs_read_stable()). */
     ret = cetrafs_read_stable(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id, CETRAFS_RECORD_READ_RETRIES,
                               CETRAFS_SR_CACHED_FRESH, !first_cached, cetrafs_sr_zg, &c, NULL, NULL);
+    if (ret == 0)
+        cetrafs_sb_zg_note_readable(sb, zg_id);
     if (ret != -EAGAIN && ret != -EUCLEAN)
         return ret;
 
@@ -268,10 +275,12 @@ static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_gro
         pr_err("ZG %u %s -- corrupted, not just a torn concurrent read\n", zg_id,
                misdirected ? "holds another group's record" : "failed its checksum repeatedly");
         cetrafs_sb_corrupt(sb, 0);
-    } else if (cetrafs_sb_zg_note_unreadable(sb, zg_id)) {
-        pr_err("ZG %u: its record %s -- damaged; this node leaves the group alone "
-               "(no claim, no release) until `fsck.cetra -r` rebuilds it\n",
-               zg_id, misdirected ? "names another Zone Group" : "failed its checksum repeatedly");
+    } else {
+        if (cetrafs_sb_zg_note_unreadable(sb, zg_id))
+            pr_err("ZG %u: its record %s -- damaged; this node leaves the group alone "
+                   "(no claim, no release) until `fsck.cetra -r` rebuilds it\n",
+                   zg_id, misdirected ? "names another Zone Group" : "failed its checksum repeatedly");
+        cetrafs_sb_zg_unreadable_rearm(sb);
     }
     return -EUCLEAN;
 }
