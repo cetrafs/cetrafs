@@ -3909,7 +3909,20 @@ int main(int argc, char **argv)
         if (total_blocks > CETRAFS_SB_REPLICA_NR)
             pread_all(fd, &copy, sizeof(copy), (off_t) CETRAFS_SB_REPLICA_NR * CETRAFS_BLOCK_SIZE);
         if (fsck_sb_verifies(&sb)) {
-            if (!fsck_sb_verifies(&copy) || !fsck_sb_same_layout(&sb, &copy)) {
+            if (fsck_sb_verifies(&copy) && !fsck_sb_same_layout(&sb, &copy) &&
+                cetrafs_sb_copy_predates(&copy, &sb)) {
+                /* A grow stopped after publishing block 0 and before its
+                 * copy (growfs_write_sb_copy()): a step left to do, not
+                 * damage -- the copy is never AHEAD of block 0, and with
+                 * block 0 gone fsck restores nothing from a copy that may
+                 * predate a grow. Rewritten by -r or a growfs re-run. */
+                sb_copy_bad = 1;
+                printf("note: the copy of block 0 at block %llu predates the last grow (layout_gen %llu, block 0 "
+                       "is at %llu) -- a grow stopped before its last write; re-running growfs.cetra or "
+                       "fsck.cetra -r rewrites it\n",
+                       (unsigned long long) CETRAFS_SB_REPLICA_NR, (unsigned long long) cetrafs_le64(copy.layout_gen),
+                       (unsigned long long) cetrafs_le64(sb.layout_gen));
+            } else if (!fsck_sb_verifies(&copy) || !fsck_sb_same_layout(&sb, &copy)) {
                 sb_copy_bad = 1;
                 fprintf(stderr, "ERR: the copy of block 0 at block %llu %s%s\n",
                         (unsigned long long) CETRAFS_SB_REPLICA_NR,

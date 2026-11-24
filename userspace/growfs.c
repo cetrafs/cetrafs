@@ -694,6 +694,32 @@ int main(int argc, char **argv)
             dev, old_total, dev_blocks);
 
     if (target_blocks <= old_total) {
+        /* A grow stopped after block 0 and before its copy: its last
+         * write is still to do, and this is the re-run that finishes it.
+         * Only a copy that is an EARLIER layout of this one: never ahead
+         * of block 0, and anything else is fsck's to judge. */
+        {
+            cetrafs_superblock_t copy;
+
+            memset(&copy, 0, sizeof(copy));
+            if (dev_blocks > CETRAFS_SB_REPLICA_NR &&
+                pread(fd, &copy, sizeof(copy), (off_t) CETRAFS_SB_REPLICA_NR * CETRAFS_BLOCK_SIZE) ==
+                    (ssize_t) sizeof(copy) &&
+                cetrafs_le32(copy.magic) == (uint32_t) CETRAFS_MAGIC &&
+                (uint32_t) cetrafs_le64(copy.checksum) ==
+                    crc32c_struct(&copy, sizeof(copy), offsetof(cetrafs_superblock_t, checksum),
+                                  sizeof(copy.checksum)) &&
+                cetrafs_sb_copy_predates(&copy, &sb)) {
+                if (dry_run) {
+                    fprintf(stdout, "cetrafs growfs: would rewrite the copy of block 0, left behind by a grow "
+                                    "that stopped before its last write\n");
+                } else {
+                    growfs_write_sb_copy(fd, &sb);
+                    fprintf(stdout, "cetrafs growfs: rewrote the copy of block 0, left behind by a grow that "
+                                    "stopped before its last write\n");
+                }
+            }
+        }
         fprintf(stdout,
                 "cetrafs growfs: nothing to do\n"
                 "  filesystem: %" PRIu64

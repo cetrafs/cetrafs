@@ -14,12 +14,14 @@
 #   3. block 0 failing its checksum: the same;
 #   4. the copy zeroed: the mount goes ahead and says so (sb_copy: bad);
 #      fsck reports it, fsck -r rewrites it;
-#   5. an offline grow carries the copy along: fsck clean after it;
+#   5. an offline grow carries the copy along: fsck clean after it; one
+#      stopped before the copy is noted (not damage) and a growfs re-run
+#      rewrites it (5b);
 #   6. so does a live one: the next mount reads the copy as current.
 #
 # DISCRIMINATION: 2 with the copy zeroed as well -- nothing restores
 # block 0 (fsck: bad magic); 5 with CETRAFS_GROWFS_TEST_NO_SB_COPY=1 --
-# fsck reports the copy describing a different layout; 6 with the same
+# fsck notes the copy predating the grow; 6 with the same
 # knob -- the next mount says sb_copy: stale.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -110,14 +112,38 @@ O4="$(ct_fsck "$DEV" 2>&1 || true)"
 # 5
 fresh
 ct_growfs "$DEV" -s 1400M >/dev/null 2>&1 || fail "5: growfs failed"
-ct_fsck "$DEV" >/dev/null 2>&1 && pass "5: an offline grow carries the copy along: fsck clean" ||
-    fail "5: $(ct_fsck "$DEV" 2>&1 | grep ERR | head -2)"
+O5="$(ct_fsck "$DEV" 2>&1)" && ! grep -q "predates the last grow" <<<"$O5" &&
+    pass "5: an offline grow carries the copy along: fsck clean, the copy current" ||
+    fail "5: $(grep -E 'ERR|predates' <<<"$O5" | head -2)"
+# A grow stopped between block 0 and its copy: a step left to do, not
+# damage. fsck notes it and exits clean (a power cut there is legal --
+# tests/crash/growfs_crash.sh), and the re-run that finishes the grow
+# writes it.
 fresh
 CETRAFS_GROWFS_TEST_NO_SB_COPY=1 ct_growfs "$DEV" -s 1400M >/dev/null 2>&1 || true
-O5="$(ct_fsck "$DEV" 2>&1 || true)"
-grep -q "describes a different layout" <<<"$O5" &&
-    pass "5 control: a grow that leaves the copy behind is reported" ||
-    fail "5 control: fsck did not see the stale copy"
+O5="$(ct_fsck "$DEV" 2>&1)" && R5=0 || R5=$?
+grep -q "predates the last grow" <<<"$O5" && [ "$R5" = 0 ] &&
+    pass "5 control: a grow that leaves the copy behind is noted, and fsck exits clean" ||
+    fail "5 control: fsck rc=$R5: $(grep -E 'ERR|predates' <<<"$O5" | head -2)"
+G5="$(ct_growfs "$DEV" -s 1400M 2>&1 || true)"
+O5="$(ct_fsck "$DEV" 2>&1)" && ! grep -q "predates the last grow" <<<"$O5" &&
+    grep -q "rewrote the copy of block 0" <<<"$G5" &&
+    pass "5b: re-running growfs finishes the grow: it rewrites the copy" ||
+    fail "5b: growfs said: $(grep -i copy <<<"$G5" | head -1); fsck: $(grep -E 'ERR|predates' <<<"$O5" | head -1)"
+# 5c: only an EARLIER layout is a step left to do. Block 0 put back to
+# the layout before the grow, beside a copy at the grown one: a copy
+# AHEAD of block 0 is never what growfs leaves, and stays an error.
+fresh
+B5="$(ct_tmp sbcopy-b0)"
+dd if="$DEV" of="$B5" bs=4096 count=1 status=none
+ct_growfs "$DEV" -s 1400M >/dev/null 2>&1 || true
+dd if="$B5" of="$DEV" bs=4096 count=1 conv=notrunc,fsync status=none
+blockdev --flushbufs "$DEV"
+O5="$(ct_fsck "$DEV" 2>&1)" && R5=0 || R5=$?
+grep -q "copy of block 0 at block $REP describes a different layout" <<<"$O5" && [ "$R5" != 0 ] &&
+    ! grep -q "predates the last grow" <<<"$O5" &&
+    pass "5c: a copy ahead of block 0 is still an error" ||
+    fail "5c: fsck rc=$R5: $(grep -E 'ERR|predates' <<<"$O5" | head -2)"
 
 # 6: a live grow (the volume mounted) carries it too; a mount after it
 # reads the copy as current. Control: the knob leaves it stale.

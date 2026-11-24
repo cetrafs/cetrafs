@@ -2095,4 +2095,41 @@ static inline int cetrafs_find_live_peer(const char *dev,
     return found;
 }
 
+/*
+ * Is 'copy' an EARLIER layout of the volume 'cur' describes -- the state a
+ * grow stopped between block 0 and its copy leaves (growfs writes the copy
+ * only after block 0)? The fields a grow changes may be smaller and
+ * layout_gen older; every other field must match byte for byte, status and
+ * CAS bookkeeping aside. The kernel's cetrafs_layout_is_grow_of() is the
+ * same test the other way round.
+ */
+static inline int cetrafs_sb_copy_predates(const cetrafs_superblock_t *copy, const cetrafs_superblock_t *cur)
+{
+    cetrafs_superblock_t a = *copy, b = *cur;
+
+    if (cetrafs_le32(cur->block_group_count) < cetrafs_le32(copy->block_group_count) ||
+        cetrafs_le32(cur->inodes_count) < cetrafs_le32(copy->inodes_count) ||
+        cetrafs_le64(cur->total_blocks) < cetrafs_le64(copy->total_blocks) ||
+        cetrafs_le64(cur->layout_gen) <= cetrafs_le64(copy->layout_gen))
+        return 0;
+    b.total_blocks = a.total_blocks;
+    b.block_group_count = a.block_group_count;
+    b.layout_gen = a.layout_gen;
+    b.tail_reserve_start = a.tail_reserve_start;
+    b.tail_reserve_blocks = a.tail_reserve_blocks;
+    b.orphan_blocks = a.orphan_blocks;
+    b.bg_data_end = a.bg_data_end;
+    b.bg_table_next = a.bg_table_next;
+    b.bg_table_first_count = a.bg_table_first_count;
+    b.inodes_count = a.inodes_count;
+    b.inode_seg_next = a.inode_seg_next;
+    b.inode_first_count = a.inode_first_count;
+    b.checksum = a.checksum;
+    b.fsck_needed_since = a.fsck_needed_since;
+    b.fsck_needed_node = a.fsck_needed_node;
+    b.fsck_needed_pad = a.fsck_needed_pad;
+    b.cas_stamp = a.cas_stamp;
+    return !memcmp(&a, &b, sizeof(a));
+}
+
 #endif /* CETRAFS_DEVUTIL_H */
