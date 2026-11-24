@@ -4915,7 +4915,15 @@ departed:
     if (sbi->lease_work_ready) {
         WRITE_ONCE(sbi->lease_active, false);
         smp_mb();
-        cancel_work_sync(&sbi->lease_work);
+        /* A lapse found by a write gate queues the work that says so; on
+         * a loaded system it can still be queued here, and cancelling it
+         * took the only record of why this unmount left no clean
+         * departure. The stop it would make is moot now; the record is
+         * not. */
+        if (cancel_work_sync(&sbi->lease_work))
+            pr_err("%s: this node's lease expired during unmount -- no heartbeat renewal reached the device in "
+                   "time; no clean departure was recorded\n",
+                   sb->s_id);
     }
     cancel_work_sync(&sbi->stop_work);
     {
