@@ -1909,9 +1909,13 @@ func doModuleReload(a ModuleReloadArgs) error {
 	if err != nil {
 		return err
 	}
+	// Always relative to the binary, never the working directory: the
+	// layout of a checkout (ctest/ctest beside kmod/). A copy elsewhere
+	// needs the same shape (README, "Where the binary goes on a node").
 	ko := filepath.Join(filepath.Dir(exe), "..", "kmod", "cetrafs.ko")
 	if _, err := os.Stat(ko); err != nil {
-		return fmt.Errorf("no module to load: %w", err)
+		return fmt.Errorf("no module to load: %w -- a reload loads ../kmod/cetrafs.ko next to the ctest "+
+			"binary's own directory (%s), as in a checkout", err, filepath.Dir(exe))
 	}
 	if _, err := os.Stat("/sys/module/cetrafs"); err == nil {
 		if out, err := exec.Command("rmmod", "cetrafs").CombinedOutput(); err != nil {

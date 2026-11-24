@@ -12,8 +12,10 @@ embed:
 	@cp ../include/cetrafs.h ../userspace/*.h embedded/
 	@cp ../userspace/fsck.c ../userspace/mkfs.c ../userspace/growfs.c embedded/
 
+# GOARCH=amd64 (or any) cross-builds for nodes of another architecture;
+# always through here, so the embedded sources are the tree's (README).
 build: embed
-	go build -o ctest .
+	CGO_ENABLED=0 GOARCH=$(or $(GOARCH),$(shell go env GOARCH)) go build -o ctest .
 
 clean:
 	rm -f ctest

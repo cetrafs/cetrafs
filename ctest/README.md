@@ -24,7 +24,29 @@ volume.
 ## Build
 
 ```
-cd ctest && go build -o ctest .
+make -C ctest build                      # this host's architecture
+make -C ctest build GOARCH=amd64         # for nodes of another one
+```
+
+**Always through `make`, never a bare `go build`.** The binary embeds
+the fsck, mkfs, growfs and test-helper sources the slaves compile, and
+`make build` refreshes that copy (`ctest/embedded/`) from the tree
+first. A bare `go build` embeds whatever copy is lying there from the
+last `make`: a slave then checks the volume with an old fsck, which
+reports a feature bit the current mkfs sets as "written by something
+newer", and every scenario's final fsck fails for no reason in the code.
+A whole release-suite run was spent on that once.
+
+## Where the binary goes on a node
+
+A scenario that reloads the module (`twin-watch`, ...) loads
+`<directory of the ctest binary>/../kmod/cetrafs.ko` -- the layout of a
+checkout, where the binary is `ctest/ctest`. Copied anywhere else, put it
+one directory down and the module beside that directory:
+
+```
+/root/ct/bin/ctest
+/root/ct/kmod/cetrafs.ko    # the same build every node runs
 ```
 
 ## Run
