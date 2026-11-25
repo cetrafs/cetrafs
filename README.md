@@ -232,10 +232,10 @@ tree needs `kmod/`, `include/` and `dkms.conf` (the module builds in `kmod/`
 and includes the shared format header from `../include`):
 
 ```
-sudo cp -r . /usr/src/cetrafs-0.10.2      # kmod/ + include/ + dkms.conf
-sudo dkms add     -m cetrafs -v 0.10.2
-sudo dkms build   -m cetrafs -v 0.10.2
-sudo dkms install -m cetrafs -v 0.10.2
+sudo cp -r . /usr/src/cetrafs-0.10.3      # kmod/ + include/ + dkms.conf
+sudo dkms add     -m cetrafs -v 0.10.3
+sudo dkms build   -m cetrafs -v 0.10.3
+sudo dkms install -m cetrafs -v 0.10.3
 ```
 
 #### Kernel upgrades
@@ -248,7 +248,7 @@ cetrafs. So keep the running kernel pinned (on Proxmox,
 `proxmox-boot-tool kernel pin <version>`) and move the pin only after
 `dkms status` lists cetrafs as installed for the new kernel.
 
-Make a distributable source tarball with `dkms mktarball -m cetrafs -v 0.10.2
+Make a distributable source tarball with `dkms mktarball -m cetrafs -v 0.10.3
 --source-only` (install it elsewhere with `dkms ldtarball` + `dkms
 install`). Keep the version in step with `debian/changelog`.
 

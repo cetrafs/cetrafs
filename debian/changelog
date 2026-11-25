@@ -1,3 +1,17 @@
+cetrafs (0.10.3) unstable; urgency=medium
+
+  * Speed: in a file with many extents -- a VM image written in place --
+    each 4 KiB of a hole cost a walk of most of the extent tree, so
+    writing new data into a sparse image and reading its unwritten
+    parts slowed down as the image fragmented. An O_DIRECT write into
+    a hole now maps the whole request at once, and a hole once looked
+    up is remembered for reads. With ~49,000 extents: 1 MiB direct
+    writes into a hole 241 -> ~720 MB/s, direct reads of a hole
+    829 MB/s -> 13 GB/s. No format change: 0.10.2 volumes mount as
+    they are.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Wed, 25 Nov 2026 08:09:56 +0000
+
 cetrafs (0.10.2) unstable; urgency=medium
 
   * Fix: on nofilelock mounts the background defragmenter ran, and kept
