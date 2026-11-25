@@ -240,7 +240,7 @@ sudo dkms install -m cetrafs -v 0.10.3
 
 #### Kernel upgrades
 
-DKMS builds cetrafs only for kernels 7.0 to 7.2: the oldest it builds
+DKMS builds cetrafs only for kernels 7.0 to 7.3: the oldest it builds
 against and the newest its sources were adapted to (`BUILD_EXCLUSIVE_KERNEL_MIN`
 / `_MAX` in `dkms.conf`). It skips any other kernel rather than building
 against an API nobody checked, and a node that boots that kernel has no

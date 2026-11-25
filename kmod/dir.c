@@ -17,6 +17,7 @@
 #include <linux/string.h>
 #include <linux/timekeeping.h>
 #include <linux/uidgid.h>
+#include <linux/version.h>
 
 #include "kmod.h"
 
@@ -3373,7 +3374,7 @@ static unsigned int cetrafs_create_prelock_stall_ms;
 cetrafs_test_param(create_prelock_stall_ms, cetrafs_create_prelock_stall_ms, uint, 0644);
 MODULE_PARM_DESC(create_prelock_stall_ms, "TEST ONLY: widen the window between a create's lookup and its namespace lock");
 
-static int cetrafs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
+static int __cetrafs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 {
     /* Only the parent: the child's record is freshly allocated, and its
      * inode-bitmap bit was claimed by an atomic CAS, so no other node
@@ -3411,6 +3412,30 @@ static int cetrafs_create(struct mnt_idmap *idmap, struct inode *dir, struct den
         ret = -ESTALE;
     return ret;
 }
+
+/*
+ * 7.3 took ->create's excl away: the method "must always assume the file
+ * does not already exist" (Documentation/filesystems/porting.rst). So
+ * every create that loses its name to a peer answers -ESTALE, and the
+ * VFS's own retry decides: both callers walk again with LOOKUP_REVAL
+ * (do_filp_open() for open(2), filename_mknodat()'s retry_estale() for
+ * mknod(2)), the walk finds the peer's file, and a plain O_CREAT opens
+ * it while O_EXCL gets EEXIST from do_open() and mknod gets it from
+ * filename_create(). What differs from the excl answer: an O_EXCL create
+ * that loses twice in a row returns ESTALE, as a plain one always has.
+ * tests/kernel/create_race_opens_peer_file.sh covers both answers.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
+static int cetrafs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+    return __cetrafs_create(idmap, dir, dentry, mode, false);
+}
+#else
+static int cetrafs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
+{
+    return __cetrafs_create(idmap, dir, dentry, mode, excl);
+}
+#endif
 
 /*
  * Create a subdirectory: allocate an inode and a single data block holding
