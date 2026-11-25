@@ -1421,8 +1421,8 @@ C20_GONE="$(comm -13 <(echo "$C20_FOUND") <(echo "$C20_LISTED"))"
 # one place, map_bh() in __cetrafs_get_block(), and it may take its
 # address only from the checked lookup: so (a) map_bh() appears in no
 # other function, (b) __cetrafs_get_block() calls no *_unchecked lookup,
-# and (c) cetrafs_tree_lookup() still calls cetrafs_lba_run_check() on
-# what it returns. Tree and dirent blocks are validated where they are
+# and (c) cetrafs_tree_lookup_hole() -- the lookup every other one goes
+# through -- still calls cetrafs_lba_run_check() on what it returns. Tree and dirent blocks are validated where they are
 # read (cetrafs_blk_tail_bread(), cetrafs_read_tree_bh_for()); frees
 # resolve the BG themselves. Negative control: a planted map_bh() in
 # another function, and a planted unchecked lookup, must both be found.
@@ -1433,12 +1433,12 @@ c12_scan() { # <file>: prints a line per violation
         /^[[:space:]]*(\*|\/\*)/ { next }
         /[^a-z_]map_bh\(/ && fn != "__cetrafs_get_block" { print "map_bh in " fn }
         fn == "__cetrafs_get_block" && /_unchecked\(/ { print "unchecked lookup in __cetrafs_get_block" }
-        fn == "cetrafs_tree_lookup" && /cetrafs_lba_run_check\(/ { checked = 1 }
-        END { if (!checked) print "cetrafs_tree_lookup no longer checks its address" }' "$1"
+        fn == "cetrafs_tree_lookup_hole" && /cetrafs_lba_run_check\(/ { checked = 1 }
+        END { if (!checked) print "cetrafs_tree_lookup_hole no longer checks its address" }' "$1"
 }
 C12P="$(mktemp)"
 cat >"$C12P" <<'EOF'
-int cetrafs_tree_lookup(struct inode *inode)
+int cetrafs_tree_lookup_hole(struct inode *inode)
 {
     return cetrafs_lba_run_check(sb, lba, 1);
 }
@@ -1746,6 +1746,7 @@ defrag.c:cetrafs_read_raw_inode_overlaid:advisory re-queue only
 dir.c:cetrafs_read_raw_inode:acts (zeroes nlink) only on success; an error leaks
 dir.c:cetrafs_rename_ns_delta:acts (set_nlink) only on success; an error leaves the count high
 dir.c:cetrafs_walk_dirents:target discovery; the locked re-check decides
+file.c:cetrafs_tree_hole_end:an error maps the one block alone; only success widens the run
 heartbeat.c:cetrafs_node_self_fence_check:pre-check; the renewal compares fence_epoch itself
 inode.c:cetrafs_sb_get_node_id:true branch skips a refresh; an error applies it, the default
 lock.c:cetrafs_node_is_stale:acts (reclaims a reader bit) only on success; an error counts the reader
@@ -2207,7 +2208,8 @@ printf 'void cetrafs_thing_cache_drop(struct inode *inode)\n{\n    ci->valid = f
 # until listed. Names only: a cache trusted under another name is not
 # seen (gap, as for class 41).
 log "checking every cache lookup is keyed on an identity, not a summary (class 51)"
-C51_REG='cetrafs_inode_ext_cache_lookup calls:cetrafs_ext_key_matches
+C51_REG='cetrafs_inode_ext_cache_lookup calls:cetrafs_inode_ext_cache_lookup_hole
+cetrafs_inode_ext_cache_lookup_hole calls:cetrafs_ext_key_matches
 cetrafs_ext_key_matches key:file_seq
 cetrafs_inode_file_seq_current key:file_seq_cached
 cetrafs_dir_needs_fresh key:dirent_seq
@@ -3135,6 +3137,7 @@ cetrafs_tree_meta_is_ours frees:decides-a-free
 cetrafs_tree_meta_set frees:decides-which-old-tree-blocks-go
 cetrafs_patch_open writes:the-tree
 cetrafs_tree_range_mapped writes:the-unit-allocation-around-a-write-is-decided-by-it
+cetrafs_tree_hole_end writes:the-run-an-O_DIRECT-write-allocates-into-a-hole
 __cetrafs_truncate_shrink frees:what-truncate-cuts
 cetrafs_zero_inplace_held writes:zeroes-and-converts-by-it'
 c53_callers() { # <files...>: "<function> <plain reader>" per call site

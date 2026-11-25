@@ -1181,6 +1181,15 @@ void cetrafs_inode_ext_cache_store(struct inode *inode,
                                    u64 ext_lba,
                                    bool uninit,
                                    u32 gen);
+bool cetrafs_inode_ext_cache_lookup_hole(struct inode *inode,
+                                         const cetrafs_inode_t *raw,
+                                         u64 iblock,
+                                         u64 *out_lba,
+                                         u32 *out_run,
+                                         bool *out_uninit,
+                                         u64 *out_hole_end);
+void cetrafs_inode_ext_cache_store_hole(struct inode *inode, const cetrafs_inode_t *raw, u64 block, u64 len, u32 gen);
+u64 cetrafs_hole_cache_hit_count(void);
 u32 cetrafs_inode_ext_cache_gen(struct inode *inode);
 u64 cetrafs_ext_cache_stale_refused_count(void);
 void cetrafs_inode_ext_cache_drop(struct inode *inode);
@@ -1736,6 +1745,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file);
 int cetrafs_lock_release(struct inode *inode, struct file *file);
 void cetrafs_inode_drop_reservation(struct inode *inode);
 bool cetrafs_inode_take_reserved(struct inode *inode, u64 want_lba, u64 *out_lba);
+u32 cetrafs_inode_take_reserved_run(struct inode *inode, u64 at_lba, u32 max);
 void cetrafs_inode_set_reservation(struct inode *inode, u64 next, u32 count, u32 bg);
 u32 cetrafs_inode_next_run_len(struct inode *inode, u32 base, u32 max);
 int cetrafs_lock_foreign_claim_exists(struct super_block *sb, u64 ino, u32 my_node_id, bool *out_exists);
@@ -1906,6 +1916,8 @@ u64 cetrafs_convert_spill_count(void);
 u64 cetrafs_convert_widened_count(void);
 u64 cetrafs_convert_healed_count(void);
 u64 cetrafs_sparse_unit_count(void);
+u64 cetrafs_dio_hole_run_count(void);
+u64 cetrafs_dio_hole_run_block_count(void);
 u64 cetrafs_convert_unit_busy_count(void);
 u64 cetrafs_tree_any_leaf_count(void);
 u64 cetrafs_tree_move_rerun_count(void);

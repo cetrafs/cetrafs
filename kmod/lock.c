@@ -113,6 +113,10 @@ struct cetrafs_ext_ent {
     u32 len;   /* how many blocks */
     u64 lba;   /* device block 'block' lives at */
     bool uninit;
+    /* [block, block + len) is a HOLE: no extent maps any of it under the
+     * key (cetrafs_inode_ext_cache_store_hole()). Answered to readers
+     * only; lba and uninit are meaningless. */
+    bool hole;
 };
 
 struct cetrafs_inode_info {
@@ -727,6 +731,27 @@ bool cetrafs_inode_take_reserved(struct inode *inode, u64 want_lba, u64 *out_lba
     return got;
 }
 
+/*
+ * Take up to 'max' blocks of the reservation in one go, but only if it
+ * continues exactly at 'at_lba' -- the block after the one the caller
+ * just got -- so what is taken extends that block's extent. Returns how
+ * many were taken; 0 when the reservation is empty or elsewhere.
+ */
+u32 cetrafs_inode_take_reserved_run(struct inode *inode, u64 at_lba, u32 max)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    u32 n = 0;
+
+    spin_lock(&ci->resv_lock);
+    if (ci->resv_remaining && ci->resv_next == at_lba) {
+        n = min(max, ci->resv_remaining);
+        ci->resv_next += n;
+        ci->resv_remaining -= n;
+    }
+    spin_unlock(&ci->resv_lock);
+    return n;
+}
+
 /* Install a fresh run, giving back any stale remainder first. */
 void cetrafs_inode_set_reservation(struct inode *inode, u64 next, u32 count, u32 bg)
 {
@@ -841,6 +866,19 @@ static bool cetrafs_ext_cache_enabled = true;
 module_param_named(ext_cache, cetrafs_ext_cache_enabled, bool, 0644);
 MODULE_PARM_DESC(ext_cache, "remember the last extent resolved per inode (default on)");
 
+/* TEST ONLY: no hole is remembered or answered -- the control of
+ * tests/kernel/hole_cache.sh (a read of a hole walks per block). */
+static bool cetrafs_hole_cache_off;
+cetrafs_test_param(hole_cache_off, cetrafs_hole_cache_off, bool, 0644);
+MODULE_PARM_DESC(hole_cache_off, "TEST ONLY: the extent cache remembers no holes");
+
+static atomic64_t cetrafs_hole_cache_hits = ATOMIC64_INIT(0);
+
+u64 cetrafs_hole_cache_hit_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_hole_cache_hits);
+}
+
 static atomic64_t cetrafs_ext_cache_hits = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_ext_cache_misses = ATOMIC64_INIT(0);
 
@@ -856,10 +894,18 @@ u64 cetrafs_ext_cache_miss_count(void)
 
 /* The record fields the entry is keyed on -- see the struct comment for
  * why these three, and for the one mutation they cannot catch. */
+/* TEST ONLY: the key leaves out the block count -- the negative control
+ * of tests/kernel/hole_cache.sh: an allocation into a remembered hole is
+ * then invisible to the key, and the hole answers for the new data. */
+static bool cetrafs_ext_key_no_blocks;
+cetrafs_test_param(ext_key_no_blocks, cetrafs_ext_key_no_blocks, bool, 0644);
+MODULE_PARM_DESC(ext_key_no_blocks, "TEST ONLY: the extent cache key ignores the block count");
+
 static bool cetrafs_ext_key_matches(const struct cetrafs_inode_info *ci, const cetrafs_inode_t *raw)
 {
     return ci->ext_key_seq == cetrafs_le64(raw->file_seq) && ci->ext_key_depth == cetrafs_le16(raw->eh.eh_depth) &&
-           ci->ext_key_entries == cetrafs_le16(raw->eh.eh_entries) && ci->ext_key_blocks == cetrafs_le64(raw->blocks);
+           ci->ext_key_entries == cetrafs_le16(raw->eh.eh_entries) &&
+           (ci->ext_key_blocks == cetrafs_le64(raw->blocks) || READ_ONCE(cetrafs_ext_key_no_blocks));
 }
 
 /*
@@ -876,6 +922,24 @@ bool cetrafs_inode_ext_cache_lookup(struct inode *inode,
                                     u32 *out_run,
                                     bool *out_uninit)
 {
+    return cetrafs_inode_ext_cache_lookup_hole(inode, raw, iblock, out_lba, out_run, out_uninit, NULL);
+}
+
+/*
+ * The same, and with 'out_hole_end' a READER may also be answered "a
+ * hole, up to here": true with *out_hole_end > iblock and nothing else
+ * set. NULL never sees a hole entry -- a writer must find out for
+ * itself, under its own lock, before it allocates (a stale "hole" there
+ * would map a second block over data the file already has).
+ */
+bool cetrafs_inode_ext_cache_lookup_hole(struct inode *inode,
+                                         const cetrafs_inode_t *raw,
+                                         u64 iblock,
+                                         u64 *out_lba,
+                                         u32 *out_run,
+                                         bool *out_uninit,
+                                         u64 *out_hole_end)
+{
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     bool hit = false;
 
@@ -889,6 +953,15 @@ bool cetrafs_inode_ext_cache_lookup(struct inode *inode,
         for (i = 0; i < ci->ext_n && !hit; i++) {
             const struct cetrafs_ext_ent *e = &ci->ext_ent[i];
 
+            if (e->hole) {
+                if (out_hole_end && !READ_ONCE(cetrafs_hole_cache_off) && iblock >= e->block &&
+                    iblock < e->block + e->len) {
+                    *out_hole_end = e->block + e->len;
+                    hit = true;
+                    atomic64_inc(&cetrafs_hole_cache_hits);
+                }
+                continue;
+            }
             if (iblock >= e->block && iblock < e->block + e->len) {
                 *out_lba = e->lba + (iblock - e->block);
                 if (out_run)
@@ -992,6 +1065,68 @@ void cetrafs_inode_ext_cache_store(struct inode *inode,
     e->len = ext_len;
     e->lba = ext_lba;
     e->uninit = uninit;
+    e->hole = false;
+    spin_unlock(&ci->resv_lock);
+}
+
+/*
+ * Remember that [block, block + len) is a hole, as a walk that missed
+ * just proved against 'raw' (cetrafs_tree_lookup_hole()). Without it a
+ * read of a hole walked the tree once per 4 KiB block -- the DIO code
+ * and readahead ask block by block for a hole -- and a miss reads every
+ * leaf whose range covers the block: 1.3M tree reads per GiB of hole
+ * read from a file of ~49,000 extents.
+ *
+ * Valid under the same key as an extent, and for the same reason: what
+ * fills a hole allocates, and an allocation moves raw->blocks (the key);
+ * fallocate, a tree build or patch and a convert drop the whole cache
+ * outright. Answered to readers only (cetrafs_inode_ext_cache_lookup_hole()).
+ */
+void cetrafs_inode_ext_cache_store_hole(struct inode *inode, const cetrafs_inode_t *raw, u64 block, u64 len, u32 gen)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    unsigned int max = clamp(READ_ONCE(cetrafs_ext_cache_entries), 1u, (unsigned int) CETRAFS_EXT_CACHE_MAX);
+    struct cetrafs_ext_ent *e;
+    u8 slot;
+
+    if (!len || !cetrafs_ext_cache_enabled || READ_ONCE(cetrafs_hole_cache_off))
+        return;
+    len = min_t(u64, len, CETRAFS_EXT_LEN_MASK);
+
+    spin_lock(&ci->resv_lock);
+    if (ci->ext_gen != gen && !cetrafs_ext_cache_ignore_gen) {
+        spin_unlock(&ci->resv_lock);
+        atomic64_inc(&cetrafs_ext_cache_stale_refused);
+        return;
+    }
+    if (!(ci->ext_valid && cetrafs_ext_key_matches(ci, raw))) {
+        ci->ext_key_depth = cetrafs_le16(raw->eh.eh_depth);
+        ci->ext_key_entries = cetrafs_le16(raw->eh.eh_entries);
+        ci->ext_key_blocks = cetrafs_le64(raw->blocks);
+        ci->ext_key_seq = cetrafs_le64(raw->file_seq);
+        ci->ext_n = 0;
+        ci->ext_next = 0;
+        ci->ext_valid = true;
+    }
+    for (slot = 0; slot < ci->ext_n; slot++) {
+        e = &ci->ext_ent[slot];
+        if (e->hole && block >= e->block && block + len <= e->block + e->len) {
+            spin_unlock(&ci->resv_lock);
+            return; /* already inside a remembered hole */
+        }
+    }
+    if (ci->ext_n < max) {
+        slot = ci->ext_n++;
+    } else {
+        slot = ci->ext_next % max;
+        ci->ext_next = (u8) ((slot + 1) % max);
+    }
+    e = &ci->ext_ent[slot];
+    e->block = block;
+    e->len = (u32) len;
+    e->lba = 0;
+    e->uninit = false;
+    e->hole = true;
     spin_unlock(&ci->resv_lock);
 }
 

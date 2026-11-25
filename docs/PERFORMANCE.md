@@ -675,6 +675,59 @@ one request per call without it.
 `statfs_fresh_ms=0`); the cost of one fresh read by
 `tests/kernel/statfs_zg_batched.sh`.
 
+## 22. A hole is looked up once, not once per block
+
+A lookup that misses proves a hole, and in an unordered tree that means
+reading every leaf whose range covers the block: its cost grows with the
+file's extent count. A VM image is exactly a large, sparse, fragmented
+file -- a qcow2 with metadata preallocation is all holes until the guest
+writes -- and two paths paid that walk for every 4 KiB block of a hole:
+
+- **An O_DIRECT write into a hole** allocated one block per get_block
+  call, so the DIO code came back 256 times for a 1 MiB write. Now the
+  blocks after the first, as far as the request, the hole and the file's
+  reservation (`cetrafs_inode_take_reserved_run()`) all reach, go into
+  the same extent and the same mapping, allocated preallocated and
+  tracked for the completion together like any widened DIO mapping.
+- **A read of a hole** (O_DIRECT or buffered): the DIO code and
+  readahead ask for a hole one block at a time. Now the miss also works
+  out where the hole ends -- from the leaves it read and the starts of
+  the children it skipped, no extra I/O -- and the extent cache
+  remembers the hole under its usual key. What fills a hole allocates,
+  which moves the key's block count, and every conversion drops the
+  cache besides; a remembered hole answers READS only, so a mapping that
+  may allocate always walks for itself (`cetrafs_inode_ext_cache_lookup_hole()`).
+
+The write side reuses the hole end its own lookup computed, so it walks
+once per request, not twice.
+
+**Measured** on an FC array, 1 GiB, in a file of ~49,000 extents against
+one with none:
+
+| | before | after | no extents |
+|---|---|---|---|
+| O_DIRECT 1 MiB write into a hole | 241-243 MB/s | 709-748 | 616-696 |
+| O_DIRECT 1 MiB read of a hole | 829 MB/s | 13.0 GB/s | 14.1-15.8 GB/s |
+| buffered read of a hole | 587 MB/s | 2.0 GB/s | 2.0-2.1 GB/s |
+
+Lookup misses per GiB: 264,195 -> ~3,200 for the write, 262,144 -> 1
+for the read. Inside a guest on a qcow2 of ~32,800 extents, a fresh
+write ran at 175-234 MB/s depending on qemu's aio mode, against 455-510
+on a near-empty image.
+
+Not covered: a BUFFERED write into a hole still looks it up per block --
+each page's allocation moves the key, so the hole is never reused
+(`docs/internal/TODO.md`).
+
+`dio_hole_runs` / `dio_hole_run_blocks` and `hole_cache_hits` in procfs
+`info` count both.
+
+**Guarded by:** `tests/kernel/dio_hole_run.sh` (control
+`dio_hole_run_off=1`) and `tests/kernel/hole_cache.sh` (controls
+`hole_cache_off=1`; `ext_key_no_blocks=1` with `ext_cache_skip_drop=1`,
+under which a remembered hole hides writes, and `ext_cache_skip_drop=1`
+alone, under which the key by itself keeps them visible).
+
 ## Measured baseline
 
 On the reference hardware -- an enterprise FC array over 32GFC multipath (two

@@ -4086,16 +4086,43 @@ struct cetrafs_lookup_ctx {
     bool *out_uninit;
     bool found;
     struct cetrafs_ext_span span;
+    /* On a miss: no block of [iblock, hole_end) is mapped. Bounded by
+     * the nearest extent after iblock in every leaf the walk read, and
+     * by the start of every child it skipped as lying after iblock --
+     * a child's range bounds everything under it, which is what makes
+     * skipping it right at all. U64_MAX: nothing found after. */
+    u64 hole_end;
 };
+
+/* The first block after 'iblock' an array maps, or U64_MAX. */
+static u64 cetrafs_leaf_array_next_after(const cetrafs_extent_t *arr, u32 entries, u64 iblock)
+{
+    u64 next = U64_MAX;
+    u32 i;
+
+    for (i = 0; i < entries; i++) {
+        u64 eb = cetrafs_ee_lblk(&arr[i]);
+
+        if (eb > iblock && eb < next)
+            next = eb;
+    }
+    return next;
+}
 
 /* THE point of ei_block_end: a child whose range excludes this block is
  * never read. Without it the walk read every leaf until it hit -- ~56 of
  * 113 on a fragmented VM image, per mapped block. */
 static int cetrafs_lookup_want(struct cetrafs_tw *w, const cetrafs_extent_idx_t *ie, int level)
 {
-    const struct cetrafs_lookup_ctx *c = w->ctx;
+    struct cetrafs_lookup_ctx *c = w->ctx;
 
-    return cetrafs_idx_may_hold(ie, c->iblock) ? CETRAFS_TW_DESCEND : CETRAFS_TW_SKIP;
+    if (cetrafs_idx_may_hold(ie, c->iblock))
+        return CETRAFS_TW_DESCEND;
+    /* Skipped: its range excludes iblock (may_hold says yes to an
+     * unknown one). One that starts after it bounds the hole. */
+    if (cetrafs_ei_lo(ie) > c->iblock && cetrafs_ei_lo(ie) < c->hole_end)
+        c->hole_end = cetrafs_ei_lo(ie);
+    return CETRAFS_TW_SKIP;
 }
 
 static int cetrafs_lookup_child(struct cetrafs_tw *w, const cetrafs_extent_idx_t *ie, int level)
@@ -4111,6 +4138,8 @@ static int cetrafs_lookup_leaf(struct cetrafs_tw *w, const cetrafs_extent_t *arr
     struct cetrafs_lookup_ctx *c = w->ctx;
 
     c->found = cetrafs_leaf_array_lookup(arr, n, c->iblock, c->out_lba, c->out_run, c->out_uninit, &c->span);
+    if (!c->found)
+        c->hole_end = min(c->hole_end, cetrafs_leaf_array_next_after(arr, n, c->iblock));
     return c->found ? CETRAFS_TW_STOP : 0;
 }
 
@@ -4141,11 +4170,15 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
                                          u32 *out_run,
                                          bool *out_uninit,
                                          bool *found,
-                                         bool reader)
+                                         bool reader,
+                                         u64 *out_hole_end,
+                                         bool hole_cache)
 {
     u32 egen;
 
     *found = false;
+    if (out_hole_end)
+        *out_hole_end = 0; /* unknown */
     if (out_uninit)
         *out_uninit = false;
     if (out_run)
@@ -4156,9 +4189,12 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
          * scan is a handful of comparisons over at most 4 slots and
          * touches no block at all. Nothing to cache, and nothing a
          * cache could save. */
-        *found = cetrafs_leaf_array_lookup(raw->et.leaf,
-                                           min_t(u16, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.leaf)),
-                                           iblock, out_lba, out_run, out_uninit, NULL);
+        u32 n = min_t(u16, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.leaf));
+
+        *found = cetrafs_leaf_array_lookup(raw->et.leaf, n, iblock, out_lba, out_run, out_uninit, NULL);
+        if (!*found && out_hole_end)
+            *out_hole_end = min_t(u64, cetrafs_leaf_array_next_after(raw->et.leaf, n, iblock),
+                                  CETRAFS_MAX_FILE_BLOCKS);
         return 0;
     }
 
@@ -4173,17 +4209,25 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
      * answering from memory there would be the frozen-extent-tree bug
      * with extra steps.
      */
-    if (cetrafs_tree_cache_trusted(inode, reader) &&
-        cetrafs_inode_ext_cache_lookup(inode, raw, iblock, out_lba, out_run, out_uninit)) {
-        *found = true;
-        return 0;
+    if (cetrafs_tree_cache_trusted(inode, reader)) {
+        u64 he = 0;
+
+        if (cetrafs_inode_ext_cache_lookup_hole(inode, raw, iblock, out_lba, out_run, out_uninit,
+                                                hole_cache && out_hole_end ? &he : NULL)) {
+            if (he) { /* a remembered hole (readers only) */
+                *out_hole_end = he;
+                return 0;
+            }
+            *found = true;
+            return 0;
+        }
     }
     /* Sampled before the tree is read: a drop from here on refuses the
      * store below (class 41). */
     egen = cetrafs_inode_ext_cache_gen(inode);
 
     {
-        struct cetrafs_lookup_ctx c = {iblock, out_lba, out_run, out_uninit, false, {0}};
+        struct cetrafs_lookup_ctx c = {iblock, out_lba, out_run, out_uninit, false, {0}, U64_MAX};
         struct cetrafs_tw w = {
             .ops = &cetrafs_lookup_ops,
             .inode = inode,
@@ -4198,6 +4242,8 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
         if (c.found) {
             *found = true;
             cetrafs_tree_remember(inode, raw, &c.span, egen);
+        } else if (out_hole_end) {
+            *out_hole_end = min_t(u64, c.hole_end, CETRAFS_MAX_FILE_BLOCKS);
         }
     }
     return 0;
@@ -4272,6 +4318,65 @@ static int cetrafs_tree_range_mapped(struct inode *inode, const cetrafs_inode_t 
 }
 
 /*
+ * How long is the hole at 'lo', looking no further than 'hi'? The
+ * first block of [lo, hi) that any extent maps, or 'hi' -- in one walk
+ * over the leaves whose range meets the window. An extent that maps
+ * 'lo' itself gives 'lo', a hole of none. For a writer holding
+ * invalidate_lock: the tree cannot change under the walk.
+ *
+ * Every leaf that meets the window is read: the arrays are unordered,
+ * so the nearest extent may sit in any of them. That is the cost of
+ * the range walk above, paid once for a whole O_DIRECT request rather
+ * than once per 4 KiB block of it.
+ */
+struct cetrafs_hole_ctx {
+    u64 lo, hi, first;
+};
+
+static int cetrafs_hole_want(struct cetrafs_tw *w, const cetrafs_extent_idx_t *ie, int level)
+{
+    const struct cetrafs_hole_ctx *h = w->ctx;
+
+    return cetrafs_idx_may_overlap(ie, h->lo, h->first) ? CETRAFS_TW_DESCEND : CETRAFS_TW_SKIP;
+}
+
+static int cetrafs_hole_leaf(struct cetrafs_tw *w, const cetrafs_extent_t *arr, u32 n, u64 lba)
+{
+    struct cetrafs_hole_ctx *h = w->ctx;
+    u32 i;
+
+    for (i = 0; i < n; i++) {
+        u64 eb = cetrafs_ee_lblk(&arr[i]);
+
+        if (eb < h->first && eb + cetrafs_ee_len(&arr[i]) > h->lo)
+            h->first = max(eb, h->lo);
+    }
+    return h->first == h->lo ? CETRAFS_TW_STOP : 0;
+}
+
+static const struct cetrafs_tw_ops cetrafs_hole_ops = {
+    .want = cetrafs_hole_want,
+    .leaf = cetrafs_hole_leaf,
+};
+
+static int cetrafs_tree_hole_end(struct inode *inode, const cetrafs_inode_t *raw, u64 lo, u64 hi, u64 *out_end)
+{
+    struct cetrafs_hole_ctx h = {.lo = lo, .hi = hi, .first = hi};
+    struct cetrafs_tw w = {
+        .ops = &cetrafs_hole_ops,
+        .inode = inode,
+        .read = CETRAFS_TW_WRITER,
+        .ctx = &h,
+    };
+    int ret = cetrafs_tree_walk(&w, raw);
+
+    if (ret < 0)
+        return ret;
+    *out_end = h.first;
+    return 0;
+}
+
+/*
  * The resolver above, with the one thing it never checked: that the
  * address it produced is one a file's blocks may occupy.
  *
@@ -4294,16 +4399,19 @@ static int cetrafs_tree_range_mapped(struct inode *inode, const cetrafs_inode_t 
  * nearby address that is the "right" one, and guessing would publish
  * the guess.
  */
-static int cetrafs_tree_lookup(struct inode *inode,
-                               const cetrafs_inode_t *raw,
-                               u64 iblock,
-                               u64 *out_lba,
-                               u32 *out_run,
-                               bool *out_uninit,
-                               bool *found,
-                               bool reader)
+static int cetrafs_tree_lookup_hole(struct inode *inode,
+                                    const cetrafs_inode_t *raw,
+                                    u64 iblock,
+                                    u64 *out_lba,
+                                    u32 *out_run,
+                                    bool *out_uninit,
+                                    bool *found,
+                                    bool reader,
+                                    u64 *out_hole_end,
+                                    bool hole_cache)
 {
-    int ret = cetrafs_tree_lookup_unchecked(inode, raw, iblock, out_lba, out_run, out_uninit, found, reader);
+    int ret = cetrafs_tree_lookup_unchecked(inode, raw, iblock, out_lba, out_run, out_uninit, found, reader,
+                                            out_hole_end, hole_cache);
 
     if (ret || !*found)
         return ret;
@@ -4322,6 +4430,19 @@ static int cetrafs_tree_lookup(struct inode *inode,
         return -EUCLEAN;
     }
     return 0;
+}
+
+/* A miss reports nothing about the hole, and no remembered hole answers. */
+static int cetrafs_tree_lookup(struct inode *inode,
+                               const cetrafs_inode_t *raw,
+                               u64 iblock,
+                               u64 *out_lba,
+                               u32 *out_run,
+                               bool *out_uninit,
+                               bool *found,
+                               bool reader)
+{
+    return cetrafs_tree_lookup_hole(inode, raw, iblock, out_lba, out_run, out_uninit, found, reader, NULL, false);
 }
 
 /* The physical LBA just past the file's last extent -- the contiguity
@@ -6890,6 +7011,25 @@ MODULE_PARM_DESC(sparse_unit_off, "TEST ONLY: a first write into a sparse hole a
 static bool cetrafs_sparse_unit_zeroes_check_off;
 cetrafs_test_param(sparse_unit_zeroes_check_off, cetrafs_sparse_unit_zeroes_check_off, bool, 0644);
 
+/* TEST ONLY: an O_DIRECT write into a hole allocates one block per
+ * call, as before (tests/kernel/dio_hole_run.sh's control). */
+static bool cetrafs_dio_hole_run_off;
+cetrafs_test_param(dio_hole_run_off, cetrafs_dio_hole_run_off, bool, 0644);
+MODULE_PARM_DESC(dio_hole_run_off, "TEST ONLY: an O_DIRECT write into a hole maps one block per call");
+
+static atomic64_t cetrafs_dio_hole_runs = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_dio_hole_run_blocks = ATOMIC64_INIT(0);
+
+u64 cetrafs_dio_hole_run_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_dio_hole_runs);
+}
+
+u64 cetrafs_dio_hole_run_block_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_dio_hole_run_blocks);
+}
+
 static atomic64_t cetrafs_sparse_units = ATOMIC64_INIT(0);
 u64 cetrafs_sparse_unit_count(void)
 {
@@ -6937,6 +7077,9 @@ static int __cetrafs_get_block(struct inode *inode,
                                enum cetrafs_gb_mode mode)
 {
     u32 nalloc = 1; /* blocks this call allocated */
+    u32 mapped = 1; /* of them, from iblock on, this call maps */
+    u64 hole_end = 0; /* on a miss: [iblock, hole_end) is a hole (0 unknown) */
+    u32 egen;
     u32 want = 1, converted = 1, ahead = 0;
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t raw;
@@ -7008,6 +7151,7 @@ static int __cetrafs_get_block(struct inode *inode,
 
 relookup:
     move_seq = cetrafs_tree_move_sample(inode); /* before the record: a move may stage a new root */
+    egen = cetrafs_inode_ext_cache_gen(inode); /* likewise: a drop from here on refuses the hole store */
     ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         return ret;
@@ -7066,7 +7210,9 @@ relookup:
         cetrafs_le16(raw.eh.eh_entries) > ARRAY_SIZE(raw.et.leaf))
         return -EIO;
 
-    ret = cetrafs_tree_lookup(inode, &raw, iblock, &lba, &run, &uninit, &found, tree_reader);
+    /* A read may be answered from a remembered hole; a mapping that may
+     * allocate never is (cetrafs_inode_ext_cache_lookup_hole()). */
+    ret = cetrafs_tree_lookup_hole(inode, &raw, iblock, &lba, &run, &uninit, &found, tree_reader, &hole_end, !create);
     if (ret)
         return ret;
     /* A miss while a tree move ran is not believed: the walk may have
@@ -7291,8 +7437,16 @@ relookup:
         atomic64_add(bh_result->b_size >> inode->i_blkbits, &cetrafs_map_blocks);
         return 0;
     }
-    if (!create)
-        return 0; /* hole: leave unmapped, reader sees zeros */
+    if (!create) {
+        /* Hole: leave unmapped, reader sees zeros -- and remember it,
+         * so the next block of it does not walk the tree again (the DIO
+         * code and readahead ask for a hole one block at a time). Only
+         * a miss that is believed gets here: one a tree move overlapped
+         * re-ran above. */
+        if (hole_end > iblock && S_ISREG(inode->i_mode))
+            cetrafs_inode_ext_cache_store_hole(inode, &raw, iblock, hole_end - iblock, egen);
+        return 0;
+    }
     if (mode == CETRAFS_GB_CONVERT_PENDING) {
         /* A pending block is one a buffered write put data in, and
          * truncate and punch take theirs out of the set: a hole here is
@@ -7510,7 +7664,51 @@ relookup:
         }
     }
 
-    ret = cetrafs_tree_append(inode, &raw, iblock, lba, 1, dio_prealloc, &merged, &leaf_count);
+    /*
+     * An O_DIRECT write into a hole: the blocks after this one, as far as
+     * the request, the hole and the reservation all reach, go into the
+     * same extent and the same mapping. One block per call made the DIO
+     * code come back 256 times for a 1 MiB write, and every call began
+     * with a lookup that missed -- a walk of every leaf whose range
+     * covers the block, which on a fragmented VM image is most of them
+     * (a hole fill ran at 241 MB/s in a file of 49,000 extents, 616 in
+     * an empty one). Now one miss and one hole walk per request.
+     *
+     * The blocks are allocated preallocated like the first and tracked
+     * for the completion together (cetrafs_dio_mark_convert() takes
+     * b_size): what the write does not land stays reading as zeros, as
+     * for any widened DIO mapping. invalidate_lock is held exclusively,
+     * so the hole cannot fill under the walk, and the reservation is
+     * contiguous with 'lba' by construction or not taken at all.
+     */
+    if (mode == CETRAFS_GB_DIO && S_ISREG(inode->i_mode) && !READ_ONCE(cetrafs_dio_hole_run_off)) {
+        u64 w = min_t(u64, bh_result->b_size >> inode->i_blkbits, READ_ONCE(cetrafs_alloc_run_max_blocks));
+        u64 end;
+
+        w = min_t(u64, w, CETRAFS_MAX_FILE_BLOCKS - iblock);
+        /* The hole's end comes from the lookup's own walk, under this
+         * call's invalidate_lock -- never from a remembered hole, which
+         * a mapping that allocates does not consult; a second walk to
+         * find it only when the lookup could not say. */
+        if (w > 1 && hole_end > iblock + 1) {
+            end = min(hole_end, iblock + w);
+        } else if (w > 1 && !hole_end) {
+            if (cetrafs_tree_hole_end(inode, &raw, iblock + 1, iblock + w, &end))
+                end = 0;
+        } else {
+            end = 0;
+        }
+        if (end > iblock + 1) {
+            nalloc += cetrafs_inode_take_reserved_run(inode, lba + 1, (u32) (end - iblock - 1));
+            mapped = nalloc;
+            if (nalloc > 1) {
+                atomic64_inc(&cetrafs_dio_hole_runs);
+                atomic64_add(nalloc, &cetrafs_dio_hole_run_blocks);
+            }
+        }
+    }
+
+    ret = cetrafs_tree_append(inode, &raw, iblock, lba, nalloc, dio_prealloc, &merged, &leaf_count);
     if (ret) {
         /*
          * A DIRECTORY's tree blocks go out through the journal, and a
@@ -7528,7 +7726,7 @@ relookup:
                                "keeping it allocated\n",
                                (unsigned long long) inode->i_ino, (unsigned long long) lba, ret);
         else
-            cetrafs_free_data_block(sb, lba);
+            cetrafs_free_data_extent(sb, lba, nalloc); /* named by nothing: the append failed */
         return ret;
     }
 
@@ -7633,6 +7831,8 @@ allocated:
     }
     map_bh(bh_result, sb, lba);
     set_buffer_new(bh_result);
+    if (mapped > 1) /* the hole run above: map_bh() set one block */
+        bh_result->b_size = (size_t) mapped << inode->i_blkbits;
     if (mode == CETRAFS_GB_DIO) {
         ret = cetrafs_dio_mark_convert(inode, bh_result, iblock);
         if (ret)

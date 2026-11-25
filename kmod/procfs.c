@@ -484,6 +484,9 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "convert_units_widened: %llu\n", cetrafs_convert_widened_count());
     seq_printf(m, "convert_units_healed: %llu\n", cetrafs_convert_healed_count());
     seq_printf(m, "sparse_units: %llu\n", cetrafs_sparse_unit_count());
+    seq_printf(m, "dio_hole_runs: %llu\n", cetrafs_dio_hole_run_count());
+    seq_printf(m, "dio_hole_run_blocks: %llu\n", cetrafs_dio_hole_run_block_count());
+    seq_printf(m, "hole_cache_hits: %llu\n", cetrafs_hole_cache_hit_count());
     seq_printf(m, "tree_patches: %llu\n", cetrafs_tree_patch_count());
     seq_printf(m, "defrag_segments: %llu\n", cetrafs_defrag_segment_count());
     seq_printf(m, "tree_patch_writes: %llu\n", cetrafs_tree_patch_write_count());
