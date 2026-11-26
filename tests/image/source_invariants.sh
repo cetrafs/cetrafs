@@ -3245,24 +3245,37 @@ N2_HITS="$(unkillable_walks "$K/dir.c" "$K/nslock.c" | sed "s|$K/||")"
 [ -z "$N2_HITS" ] && pass "N2: every whole-volume inode walk in the namespace layer is killable" ||
     fail "N2: an inode walk with no fatal-signal check, at: $(echo $N2_HITS)"
 
-# L-F6 (audit 2026-11-14): a task_work in this module that drops its
-# own module reference returns into freed text if unload runs between
-# the two. Unload must wait a tasks-RCU grace period first, and a build
-# without tasks RCU must never queue one. No loop-device instrument can
-# see the race short of crashing the box on rmmod, so it is checked here.
-# Negative control: the exit without the wait.
-log "checking unload waits out the namespace restart task_work's tail (L-F6)"
-lf6_ok() { # <nslock.c>: exit waits tasks RCU, the queue path is gated on it
-    awk '/^void cetrafs_nslock_exit\(void\)/ { f = 1 } f && /synchronize_rcu_tasks\(\)/ { w = 1 } f && /^\}/ { f = 0 }
-         /IS_ENABLED\(CONFIG_TASKS_RCU\)/ { g = 1 } END { exit !(w && g) }' "$1"
+# L-F6 (audit 2026-11-14), and the kernels that do not export
+# task_work_add(): the namespace restart queues its wait as the
+# ->release of an anonymous file, dropped with fput(). Two things keep
+# that sound, and no loop-device instrument can see either fail short of
+# a link error on some distribution's kernel or a crash on rmmod:
+#   - no kmod/ source calls task_work_add() -- mainline does not export
+#     it, so the module would not link on every kernel;
+#   - the file's operations name THIS_MODULE as owner: __fput() holds
+#     that reference until ->release has returned, which is what stops
+#     unload freeing the code under a pending wait.
+# Negative controls: a planted call, and the fops without an owner.
+log "checking the namespace restart needs no unexported symbol and pins the module (L-F6)"
+lf6_ok() { # <dir>: no task_work_add() call; the restart fops are owned
+    ! grep -nE '(^|[^_a-z])task_work_add\(' "$1"/*.[ch] | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(/?\*|//)' >/dev/null &&
+        awk '/^static const struct file_operations cetrafs_restart_fops/ { f = 1 } f && /\.owner = THIS_MODULE/ { o = 1 }
+             f && /^};/ { f = 0 } END { exit !o }' "$1"/nslock.c
 }
-LF6_SAMPLE="$(ct_tmp lf6-sample.c)"
-sed '/synchronize_rcu_tasks()/d' "$K/nslock.c" >"$LF6_SAMPLE"
-! lf6_ok "$LF6_SAMPLE" && pass "L-F6: control -- an exit without the grace period is caught" ||
-    fail "L-F6: control -- an exit without the grace period passes"
-grep -q 'task_work_add(' "$K/nslock.c" || fail "L-F6: setup: no task_work in nslock.c -- the check is stale"
-lf6_ok "$K/nslock.c" && pass "L-F6: unload waits a tasks-RCU grace period, and only a build with it queues the work" ||
-    fail "L-F6: nslock.c queues a module task_work that unload does not wait out"
+LF6_DIR="$(ct_tmp lf6-call)"
+rm -f "$LF6_DIR" && mkdir "$LF6_DIR"
+cp "$K/nslock.c" "$LF6_DIR/"
+printf '%s\n' 'static int f(void)' '{' '    return task_work_add(current, &w, TWA_SIGNAL);' '}' >"$LF6_DIR/planted.c"
+! lf6_ok "$LF6_DIR" && pass "L-F6: control -- a planted task_work_add() call is caught" ||
+    fail "L-F6: control -- a planted task_work_add() call passes"
+rm -f "$LF6_DIR/planted.c"
+sed -i '/\.owner = THIS_MODULE/d' "$LF6_DIR/nslock.c"
+! lf6_ok "$LF6_DIR" && pass "L-F6: control -- restart fops without an owner are caught" ||
+    fail "L-F6: control -- restart fops without an owner pass"
+rm -rf "$LF6_DIR"
+grep -q 'cetrafs_restart_fops' "$K/nslock.c" || fail "L-F6: setup: no restart fops in nslock.c -- the check is stale"
+lf6_ok "$K" && pass "L-F6: no task_work_add() call, and the restart's file pins the module until its release returns" ||
+    fail "L-F6: kmod/ calls task_work_add(), or the restart fops do not name THIS_MODULE as owner"
 
 # C11 (audit 2026-11-14): an on-disk __le field stored to, or compared with,
 # a bare constant. sparse (make endian-check) passes a ZERO constant, and a

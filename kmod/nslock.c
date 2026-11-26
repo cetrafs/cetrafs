@@ -48,7 +48,9 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
-#include <linux/task_work.h>
+#include <linux/anon_inodes.h>
+#include <linux/file.h>
+#include <linux/sched/mm.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/string.h>
@@ -1065,11 +1067,12 @@ int cetrafs_nslock_acquire_set(struct inode **inodes, int n)
  * behind one operation that was itself merely waiting. So an operation
  * called with those locks tries ONCE (no sleep while holding them); if a
  * peer holds a lock it needs, it has changed nothing, and it returns
- * -ERESTARTNOINTR with a task_work queued. The task_work runs as the
- * task returns to user space, with no VFS lock held, and sleeps one
- * retry interval (killable); the kernel then restarts the system call
- * -- -ERESTARTNOINTR with no signal delivered is a restart -- which takes
- * the VFS locks afresh and tries again. Only the caller waits.
+ * -ERESTARTNOINTR with a wait queued for the task's return to user
+ * space (cetrafs_restart_queue()). The wait runs there, with no VFS lock
+ * held, and sleeps one retry interval (killable); the kernel then
+ * restarts the system call -- -ERESTARTNOINTR with no signal delivered
+ * is a restart -- which takes the VFS locks afresh and tries again. Only
+ * the caller waits.
  *
  * The budget is unchanged: a per-task deadline, kept across the
  * restarts, ends it with EBUSY exactly where the in-lock wait gave up.
@@ -1083,12 +1086,17 @@ int cetrafs_nslock_acquire_set(struct inode **inodes, int n)
  * completions turn a restart code into EINTR, and a security.* xattr
  * that IMA/EVM sets from __fput(), whose return nobody reads.
  *
- * The task_work's code is in this module: it holds a module reference
- * from task_work_add() until its last statement (the drain rule 20
- * asks for); the task's own return to user space is what runs it,
- * microseconds after the system call left this filesystem. The return
- * after that last statement is still this module's text, which unload
- * waits out with a tasks-RCU grace period (cetrafs_nslock_exit()).
+ * How the wait gets to the return to user space: NOT task_work_add().
+ * Mainline Linux does not export it; the kernels that do (Debian's,
+ * Proxmox's before 7.3) patch the export in for Android binder built as
+ * a module, and Proxmox's 7.3 builds binder in and lost it -- cetrafs
+ * then failed to link there. What every kernel exports is fput(), and
+ * fput() of a user task's last reference to a file defers the close to
+ * that task's return to user space (__fput_deferred()). So the wait is
+ * the ->release of a private anonymous file, dropped as the operation
+ * returns. The file's f_op->owner is this module: __fput() holds that
+ * reference until ->release has returned, so unload cannot free the
+ * code under it (the drain rule 20 asks for), with no tasks-RCU wait.
  */
 static bool cetrafs_nslock_restart_off;
 cetrafs_test_param(nslock_restart_off, cetrafs_nslock_restart_off, bool, 0644);
@@ -1283,16 +1291,9 @@ void cetrafs_nslock_exit(void)
 {
     struct cetrafs_nswait_deadline *d, *tmp;
 
-    /* The restart wait's last statement drops the module reference, and
-     * its return still executes in this module's text: an unload in
-     * between freed the code under it (audit 2026-11-14 L-F6). A
-     * tasks-RCU grace period ends only once every task has switched
-     * voluntarily or returned to user space -- past that return. Only
-     * then is the text ours to free. */
-#ifdef CONFIG_TASKS_RCU
-    synchronize_rcu_tasks();
-#endif
-
+    /* No wait queued by cetrafs_restart_queue() can be pending here: each
+     * holds a module reference (its file's f_op->owner) until its
+     * ->release has returned, so the module cannot be unloading. */
     list_for_each_entry_safe(d, tmp, &cetrafs_nswait_list, node) {
         list_del(&d->node);
         kfree(d);
@@ -1306,41 +1307,103 @@ static bool cetrafs_nslock_can_restart(void)
 #ifdef PF_USER_WORKER
     no |= PF_USER_WORKER;
 #endif
-    /* Without tasks RCU, unload cannot wait out the task_work's tail
-     * (cetrafs_nslock_exit()): such a build keeps the in-lock wait. */
-    return IS_ENABLED(CONFIG_TASKS_RCU) && !(current->flags & no) && !fatal_signal_pending(current) &&
-           !READ_ONCE(cetrafs_nslock_restart_off);
+    return !(current->flags & no) && !fatal_signal_pending(current) && !READ_ONCE(cetrafs_nslock_restart_off);
+}
+
+/*
+ * Work to run as the current task returns to user space, after the
+ * system call has left this filesystem and dropped the VFS's locks.
+ * Embedded in its owner; fn frees the owner.
+ */
+struct cetrafs_restart {
+    void (*fn)(struct cetrafs_restart *r);
+    const struct task_struct *task; /* compared, never dereferenced */
+};
+
+/* Waits that ran somewhere other than the queuing task's return to user
+ * space: fput() fell back to its workqueue. Expected zero (the restart
+ * is refused to exiting tasks and kernel threads, the only fallbacks). */
+static atomic64_t cetrafs_nslock_restart_elsewhere = ATOMIC64_INIT(0);
+u64 cetrafs_nslock_restart_elsewhere_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_nslock_restart_elsewhere);
+}
+
+static bool cetrafs_restart_here(const struct cetrafs_restart *r)
+{
+    if (r->task == current)
+        return true;
+    atomic64_inc(&cetrafs_nslock_restart_elsewhere);
+    return false;
+}
+
+static int cetrafs_restart_release(struct inode *inode, struct file *file)
+{
+    struct cetrafs_restart *r = file->private_data;
+
+    r->fn(r);
+    return 0;
+}
+
+static const struct file_operations cetrafs_restart_fops = {
+    .owner = THIS_MODULE,
+    .release = cetrafs_restart_release,
+};
+
+/*
+ * 0: r->fn runs as this task returns to user space, return
+ * -ERESTARTNOINTR; r is no longer the caller's. Anything else: nothing
+ * was queued, r is still the caller's.
+ *
+ * fput() of the only reference defers the close to the return to user
+ * space for any task that is not a kernel thread or exiting -- the same
+ * moment task_work_add() gave, through the same queue. TIF_NOTIFY_SIGNAL
+ * is what TWA_SIGNAL set: it sends the exit path through the signal code,
+ * which restarts the call and runs the queued work, as before.
+ */
+static int cetrafs_restart_queue(struct cetrafs_restart *r, void (*fn)(struct cetrafs_restart *r))
+{
+    unsigned int nofs;
+    struct file *file;
+
+    r->fn = fn;
+    r->task = current;
+    /* Called with the VFS's locks held: no reclaim back into a filesystem. */
+    nofs = memalloc_nofs_save();
+    file = anon_inode_getfile("[cetrafs-nslock]", &cetrafs_restart_fops, r, O_RDONLY);
+    memalloc_nofs_restore(nofs);
+    if (IS_ERR(file))
+        return PTR_ERR(file);
+    set_tsk_thread_flag(current, TIF_NOTIFY_SIGNAL);
+    fput(file);
+    return 0;
 }
 
 struct cetrafs_nswait_work {
-    struct callback_head cb;
+    struct cetrafs_restart r;
 };
 
-static void cetrafs_nswait_run(struct callback_head *cb)
+static void cetrafs_nswait_run(struct cetrafs_restart *r)
 {
-    kfree(container_of(cb, struct cetrafs_nswait_work, cb));
-    schedule_timeout_killable(msecs_to_jiffies(CETRAFS_NSLOCK_SLEEP_MS));
-    module_put(THIS_MODULE);
+    bool here = cetrafs_restart_here(r);
+
+    kfree(container_of(r, struct cetrafs_nswait_work, r));
+    if (here)
+        schedule_timeout_killable(msecs_to_jiffies(CETRAFS_NSLOCK_SLEEP_MS));
 }
 
 /* 0: queued, return -ERESTARTNOINTR. Anything else: wait in the lock. */
 static int cetrafs_nswait_queue(void)
 {
     struct cetrafs_nswait_work *w = kmalloc(sizeof(*w), GFP_NOFS);
+    int ret;
 
     if (!w)
         return -ENOMEM;
-    if (!try_module_get(THIS_MODULE)) {
+    ret = cetrafs_restart_queue(&w->r, cetrafs_nswait_run);
+    if (ret)
         kfree(w);
-        return -ENODEV;
-    }
-    init_task_work(&w->cb, cetrafs_nswait_run);
-    if (task_work_add(current, &w->cb, TWA_SIGNAL)) {
-        module_put(THIS_MODULE);
-        kfree(w);
-        return -ESRCH;
-    }
-    return 0;
+    return ret;
 }
 
 /*
@@ -1410,7 +1473,7 @@ static bool cetrafs_settle_marked(void)
 }
 
 struct cetrafs_settle_work {
-    struct callback_head cb;
+    struct cetrafs_restart r;
     struct inode *inode;
     bool sb_pinned;
     int kills; /* cetrafs_sb_kills when queued, for the unpinned test */
@@ -1431,12 +1494,16 @@ static unsigned int cetrafs_nslock_settle_stall_ms;
 cetrafs_test_param(nslock_settle_stall_ms, cetrafs_nslock_settle_stall_ms, uint, 0644);
 MODULE_PARM_DESC(nslock_settle_stall_ms, "TEST ONLY: a deferred namespace settle sleeps this many ms first");
 
-static void cetrafs_settle_run(struct callback_head *cb)
+static void cetrafs_settle_run(struct cetrafs_restart *r)
 {
-    struct cetrafs_settle_work *w = container_of(cb, struct cetrafs_settle_work, cb);
+    struct cetrafs_settle_work *w = container_of(r, struct cetrafs_settle_work, r);
     struct inode *inode = w->inode;
     struct super_block *sb = inode->i_sb;
     u32 me;
+
+    /* On fput()'s workqueue the work still runs -- the references it
+     * holds must be dropped somewhere -- but nobody is restarting. */
+    (void) cetrafs_restart_here(r);
 
     if (READ_ONCE(cetrafs_nslock_settle_stall_ms))
         msleep(READ_ONCE(cetrafs_nslock_settle_stall_ms));
@@ -1444,7 +1511,6 @@ static void cetrafs_settle_run(struct callback_head *cb)
         /* TEST ONLY (nslock_defer_unpinned): the inode is leaked. */
         pr_err("nslock: a deferred settle outlived its superblock (nslock_defer_unpinned)\n");
         kfree(w);
-        module_put(THIS_MODULE);
         return;
     }
     if (w->what == CETRAFS_SETTLE_RECOUNT) {
@@ -1475,7 +1541,6 @@ static void cetrafs_settle_run(struct callback_head *cb)
     if (w->sb_pinned)
         deactivate_super(sb); /* may be the last: unmount finishes here */
     kfree(w);
-    module_put(THIS_MODULE);
 }
 
 /* 0: queued, the caller releases everything and returns -ERESTARTNOINTR.
@@ -1490,8 +1555,6 @@ static int cetrafs_nslock_defer(struct inode *inode, int what)
     w = kmalloc(sizeof(*w), GFP_NOFS);
     m = kmalloc(sizeof(*m), GFP_NOFS);
     if (!w || !m)
-        goto nomem;
-    if (!try_module_get(THIS_MODULE))
         goto nomem;
     /*
      * The work outlives the call: it runs as the task returns to user
@@ -1511,12 +1574,10 @@ static int cetrafs_nslock_defer(struct inode *inode, int what)
     ihold(inode);
     w->inode = inode;
     w->what = what;
-    init_task_work(&w->cb, cetrafs_settle_run);
-    if (task_work_add(current, &w->cb, TWA_SIGNAL)) {
+    if (cetrafs_restart_queue(&w->r, cetrafs_settle_run)) {
         iput(inode);
         if (w->sb_pinned)
             deactivate_super(inode->i_sb);
-        module_put(THIS_MODULE);
         goto nomem;
     }
     m->task = current;

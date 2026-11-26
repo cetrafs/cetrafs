@@ -344,6 +344,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "nslock_restarts: %llu\n", cetrafs_nslock_restart_count());
     seq_printf(m, "nslock_silent_extends: %llu\n", cetrafs_nslock_silent_extend_count());
     seq_printf(m, "nslock_settle_deferred: %llu\n", cetrafs_nslock_settle_deferred_count());
+    seq_printf(m, "nslock_restart_elsewhere: %llu\n", cetrafs_nslock_restart_elsewhere_count());
     seq_printf(m, "close_deferrals: %llu\n", cetrafs_lock_close_deferral_count());
     seq_printf(m, "convert_source_flushes: %llu\n", cetrafs_convert_source_flush_count());
     seq_printf(m, "deferred_cap_flushes: %llu\n", cetrafs_deferred_cap_flush_count());

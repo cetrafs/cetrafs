@@ -1344,6 +1344,7 @@ int cetrafs_nslock_acquire_set_vfs(struct inode **inodes, int n);
 u64 cetrafs_nslock_restart_count(void);
 u64 cetrafs_nslock_silent_extend_count(void);
 u64 cetrafs_nslock_settle_deferred_count(void);
+u64 cetrafs_nslock_restart_elsewhere_count(void);
 void cetrafs_nslock_exit(void);
 void cetrafs_nslock_release_set(struct inode **inodes, int n);
 
