@@ -1,3 +1,21 @@
+cetrafs (0.10.4) unstable; urgency=medium
+
+  * Kernel 7.3: the module builds and DKMS installs it for 7.0 to 7.3.
+    7.3 dropped the "exclusive" argument of a file create, so a create
+    that loses its name to another node now always lets the kernel walk
+    the path again: a plain open(O_CREAT) opens the other node's file and
+    O_EXCL gets EEXIST, as before.
+
+  * Fix: cetrafs did not build on kernels that do not export
+    task_work_add(), Proxmox's 7.3 series among them. Mainline never
+    exported it; distributions that build Android binder as a module add
+    the export, and Proxmox's 7.3 builds binder in. The wait for another
+    node's namespace lock still happens outside the directory's locks,
+    now on every kernel, through an interface every kernel exports.
+    No format change: 0.10.3 volumes mount as they are.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Thu, 26 Nov 2026 14:06:47 +0000
+
 cetrafs (0.10.3) unstable; urgency=medium
 
   * Speed: in a file with many extents -- a VM image written in place --
