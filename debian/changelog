@@ -12,6 +12,14 @@ cetrafs (0.10.4) unstable; urgency=medium
     the export, and Proxmox's 7.3 builds binder in. The wait for another
     node's namespace lock still happens outside the directory's locks,
     now on every kernel, through an interface every kernel exports.
+
+  * Fix: on kernel 7.3 a volume on a multipath (device-mapper) LUN found
+    no path for COMPARE AND WRITE and mounted as a single-node volume.
+    The search for the SCSI path reads /sys from the init process's
+    root; it used the kernel's own initial root, which 7.3 no longer
+    keeps as the real one, so every lookup failed. It now starts from
+    PID 1's root, and a /sys that cannot be read refuses the mount
+    instead of being taken for a device with no atomic CAW.
     No format change: 0.10.3 volumes mount as they are.
 
  -- Massimo Cetra <mcetra@gmail.com>  Thu, 26 Nov 2026 14:06:47 +0000

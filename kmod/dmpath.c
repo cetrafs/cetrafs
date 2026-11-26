@@ -46,6 +46,7 @@
 #include <linux/fs_struct.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
+#include <linux/pid_namespace.h>
 
 #include <linux/delay.h>
 #include <linux/crc32c.h>
@@ -112,6 +113,47 @@ cetrafs_test_param(dmpath_nested_walk, cetrafs_dmpath_nested_walk, bool, 0644);
  * swap waited out its window on it. The caller's walk is parked for the
  * duration and put back untouched.
  */
+/* TEST ONLY: every sysfs lookup fails ENOENT, as they all did on 7.3
+ * before the root below was PID 1's (tests/kernel/dmpath_sysfs_unreachable.sh). */
+static bool cetrafs_dmpath_sysfs_hidden;
+cetrafs_test_param(dmpath_sysfs_hidden, cetrafs_dmpath_sysfs_hidden, bool, 0644);
+MODULE_PARM_DESC(dmpath_sysfs_hidden, "TEST ONLY: make /sys unreachable to the dm path walk");
+
+/*
+ * The root of the init process -- PID 1 of the initial pid namespace,
+ * the host's root whatever the caller's.
+ *
+ * NOT init_task's. That used to be the same thing, and from Linux 7.3 on
+ * it is not: init_task (and every kernel thread) keeps the kernel's own
+ * initial root, which is now an empty filesystem the real root is
+ * mounted ON TOP of -- and a lookup that STARTS at a root never crosses
+ * a mount stacked on that root. Every /sys lookup then failed ENOENT,
+ * every multipath LUN looked like a device with nothing under it, and
+ * the volume mounted on the no-CAW fallback, one node only. /proc/2/root
+ * shows it: empty on 7.3, the real root on 7.1.
+ */
+static int cetrafs_init_root(struct path *root)
+{
+    struct task_struct *init;
+    int ret = -ESRCH;
+
+    rcu_read_lock();
+    init = READ_ONCE(init_pid_ns.child_reaper);
+    if (init)
+        get_task_struct(init);
+    rcu_read_unlock();
+    if (!init)
+        return ret;
+    task_lock(init);
+    if (init->fs) {
+        get_fs_root(init->fs, root);
+        ret = 0;
+    }
+    task_unlock(init);
+    put_task_struct(init);
+    return ret;
+}
+
 static struct file *cetrafs_sysfs_open(const char *path, int flags)
 {
     struct nameidata *outer = current->nameidata;
@@ -119,11 +161,18 @@ static struct file *cetrafs_sysfs_open(const char *path, int flags)
     struct cred *kcred;
     const struct cred *old;
     struct file *f;
+    int ret;
 
+    if (READ_ONCE(cetrafs_dmpath_sysfs_hidden))
+        return ERR_PTR(-ENOENT);
+    ret = cetrafs_init_root(&root);
+    if (ret)
+        return ERR_PTR(ret);
     kcred = prepare_kernel_cred(&init_task);
-    if (!kcred)
+    if (!kcred) {
+        path_put(&root);
         return ERR_PTR(-ENOMEM);
-    get_fs_root(init_task.fs, &root);
+    }
     old = override_creds(kcred);
     if (!READ_ONCE(cetrafs_dmpath_nested_walk))
         current->nameidata = NULL;
@@ -238,7 +287,31 @@ static int cetrafs_dm_collect(const char *disk_name, dev_t *out, unsigned int ma
 
     f = cetrafs_sysfs_open(path, O_RDONLY | O_DIRECTORY);
     if (IS_ERR(f)) {
-        ret = PTR_ERR(f); /* not a stacked device: nothing under it */
+        ret = PTR_ERR(f);
+        if (depth > 0)
+            goto out_free; /* a slave of ours without a slaves directory: nothing under it */
+        /*
+         * The device asked about. "No slaves directory" is an answer only
+         * if the device itself is visible: a kernel built without holder
+         * links has none, and a loop device there has nothing under it.
+         * When /sys/block/<disk> cannot be reached either, nothing was
+         * learned at all, and reading that as "not stacked" is what put
+         * every multipath LUN on the no-CAW fallback under Linux 7.3
+         * (cetrafs_init_root()). Say so and let the mount be refused.
+         */
+        if (snprintf(path, sizeof(path), "/sys/block/%s", disk_name) < (int) sizeof(path)) {
+            struct file *df = cetrafs_sysfs_open(path, O_RDONLY | O_DIRECTORY);
+
+            if (!IS_ERR(df)) {
+                filp_close(df, NULL);
+                ret = 0; /* visible, and nothing stacked under it */
+                goto out_free;
+            }
+        }
+        pr_err("dm path: /sys/block/%s cannot be read (%d) -- cannot tell whether a SCSI path with atomic CAW "
+               "is underneath; refusing rather than assuming there is none\n",
+               disk_name, ret);
+        ret = -EIO;
         goto out_free;
     }
 

@@ -741,6 +741,11 @@ int cetrafs_caw_discover(struct block_device *bdev, struct cetrafs_caw_info *out
                    bdev->bd_disk->disk_name);
             return -EAGAIN;
         }
+        /* Anything but "nothing SCSI underneath" is "could not tell" --
+         * the walk itself failed (dmpath.c said why). Same reasoning as
+         * the VPD read below: refuse, never default to no CAW. */
+        if (prc && prc != -ENODEV)
+            return prc;
     }
     if (sdev) {
         unsigned char *vpd = kzalloc(64, GFP_KERNEL);
